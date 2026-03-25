@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const https = require('https');
 require('dotenv').config();
 
 const app = express();
@@ -38,88 +39,14 @@ async function refreshToken() {
 refreshToken();
 setInterval(refreshToken, 50 * 60 * 1000);
 
-// MARK: - Mood Definitions (artist names, resolved to IDs at runtime)
-const MOODS = {
-  'late night': {
-    seedArtistNames: ['The National', 'Bon Iver', 'Sufjan Stevens'],
-    features: { target_energy: 0.25, target_valence: 0.25, target_acousticness: 0.75, target_tempo: 80 }
-  },
-  'heartbreak': {
-    seedArtistNames: ['Phoebe Bridgers', 'Frank Ocean', 'Lana Del Rey'],
-    features: { target_energy: 0.35, target_valence: 0.2, target_acousticness: 0.6, target_tempo: 90 }
-  },
-  'feel good': {
-    seedArtistNames: ['Stevie Wonder', 'Daft Punk', 'Michael Jackson'],
-    features: { target_energy: 0.8, target_valence: 0.9, target_danceability: 0.75, target_tempo: 115 }
-  },
-  'driving': {
-    seedArtistNames: ['Arctic Monkeys', 'The Strokes', 'Queens of the Stone Age'],
-    features: { target_energy: 0.85, target_valence: 0.6, target_danceability: 0.6, target_tempo: 130 }
-  },
-  'focus': {
-    seedArtistNames: ['Miles Davis', 'John Coltrane', 'Bill Evans'],
-    features: { target_energy: 0.3, target_valence: 0.4, target_acousticness: 0.7, target_instrumentalness: 0.7, target_tempo: 95 }
-  },
-  'summer': {
-    seedArtistNames: ['Vampire Weekend', 'The Beach Boys', 'Tame Impala'],
-    features: { target_energy: 0.7, target_valence: 0.8, target_danceability: 0.65, target_tempo: 110 }
-  }
-};
-
-// Cache resolved artist IDs so we don't look them up every time
-const artistIdCache = {};
-
-async function resolveArtistId(name) {
-  if (artistIdCache[name]) return artistIdCache[name];
-
-  const result = await axios.get('https://api.spotify.com/v1/search', {
-    headers: { Authorization: `Bearer ${access_token}` },
-    params: { q: name, type: 'artist', limit: 1 }
+// MARK: - Keep-alive
+setInterval(() => {
+  https.get('https://resonance-proxy.onrender.com', (res) => {
+    console.log('🏓 Keep-alive ping:', res.statusCode);
+  }).on('error', (err) => {
+    console.log('🏓 Keep-alive error:', err.message);
   });
-
-  const artist = result.data.artists.items[0];
-  if (!artist) throw new Error(`Artist not found: ${name}`);
-
-  artistIdCache[name] = artist.id;
-  console.log(`✅ Resolved "${name}" → ${artist.id}`);
-  return artist.id;
-}
-
-async function getAlbumsFromRecommendations(artistNames, features, limit = 10) {
-  const seedArtistIds = await Promise.all(artistNames.map(resolveArtistId));
-
-  const params = {
-    seed_artists: seedArtistIds.join(','),
-    limit: 20,
-    ...features
-  };
-
-  const recResponse = await axios.get('https://api.spotify.com/v1/recommendations', {
-    headers: { Authorization: `Bearer ${access_token}` },
-    params
-  });
-
-  const tracks = recResponse.data.tracks;
-  const seenAlbumIds = new Set();
-  const uniqueAlbums = [];
-
-  for (const track of tracks) {
-    const album = track.album;
-    if (!seenAlbumIds.has(album.id)) {
-      seenAlbumIds.add(album.id);
-      uniqueAlbums.push({
-        id: album.id,
-        name: album.name,
-        artists: album.artists,
-        images: album.images,
-        release_date: album.release_date
-      });
-    }
-    if (uniqueAlbums.length >= limit) break;
-  }
-
-  return uniqueAlbums;
-}
+}, 14 * 60 * 1000);
 
 // MARK: - Root
 app.get('/', (req, res) => {
@@ -167,30 +94,6 @@ app.get('/search', async (req, res) => {
     }
   } catch (error) {
     console.error('🔍 Search failed:', error.response?.data || error.message);
-    res.status(500).json({ error: error.response?.data || error.message });
-  }
-});
-
-// MARK: - Mood Recommendations
-app.get('/recommendations', async (req, res) => {
-  const { mood } = req.query;
-  if (!mood) return res.status(400).json({ error: 'Missing mood parameter' });
-
-  const moodKey = mood.toLowerCase();
-  const moodConfig = MOODS[moodKey];
-
-  if (!moodConfig) {
-    return res.status(400).json({ error: `Unknown mood: ${mood}. Available: ${Object.keys(MOODS).join(', ')}` });
-  }
-
-  try {
-    const albums = await getAlbumsFromRecommendations(
-      moodConfig.seedArtistNames,
-      moodConfig.features
-    );
-    res.json(albums);
-  } catch (error) {
-    console.error('❌ Recommendations failed:', error.response?.data || error.message);
     res.status(500).json({ error: error.response?.data || error.message });
   }
 });
