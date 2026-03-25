@@ -11,7 +11,6 @@ app.use(express.json());
 
 let access_token = '';
 
-// MARK: - Token Management
 async function refreshToken() {
   const { CLIENT_ID, CLIENT_SECRET } = process.env;
   if (!CLIENT_ID || !CLIENT_SECRET) {
@@ -39,63 +38,58 @@ async function refreshToken() {
 refreshToken();
 setInterval(refreshToken, 50 * 60 * 1000);
 
-// MARK: - Mood Definitions
-// Seed artist IDs + audio feature targets per mood
+// MARK: - Mood Definitions (artist names, resolved to IDs at runtime)
 const MOODS = {
   'late night': {
-    seedArtists: [
-      '2TI7qyDE0QfyOlnbtfDo7L', // The National
-      '4ZGK4hkNX6pilAGnJbGBRf', // Bon Iver
-      '4MXUO7sVCaFgFjoTI5ox5c', // Sufjan Stevens
-    ],
+    seedArtistNames: ['The National', 'Bon Iver', 'Sufjan Stevens'],
     features: { target_energy: 0.25, target_valence: 0.25, target_acousticness: 0.75, target_tempo: 80 }
   },
   'heartbreak': {
-    seedArtists: [
-      '1r1uxoy19fzMxunt3ONAkG', // Phoebe Bridgers
-      '2h93pZq0e7k5yf4dywlkpM', // Frank Ocean
-      '00FQb4jTyendYWaN8pK0wa', // Lana Del Rey
-    ],
+    seedArtistNames: ['Phoebe Bridgers', 'Frank Ocean', 'Lana Del Rey'],
     features: { target_energy: 0.35, target_valence: 0.2, target_acousticness: 0.6, target_tempo: 90 }
   },
   'feel good': {
-    seedArtists: [
-      '0bo0OinDHHBiU9GpjHn3rM', // Stevie Wonder (corrected)
-      '4tZwfgrHOc3mvqYlEYSvVi', // Daft Punk
-      '3fMbdgg4jU18AjLCKBhRSm', // Michael Jackson
-    ],
+    seedArtistNames: ['Stevie Wonder', 'Daft Punk', 'Michael Jackson'],
     features: { target_energy: 0.8, target_valence: 0.9, target_danceability: 0.75, target_tempo: 115 }
   },
   'driving': {
-    seedArtists: [
-      '7Ln80lUS6He07XvHI8qqHH', // Arctic Monkeys
-      '0epOFNiUfyOchXa0Y3KVEK', // The Strokes
-      '004gAQE0aEFGMXPHDpRKOv', // QOTSA
-    ],
+    seedArtistNames: ['Arctic Monkeys', 'The Strokes', 'Queens of the Stone Age'],
     features: { target_energy: 0.85, target_valence: 0.6, target_danceability: 0.6, target_tempo: 130 }
   },
   'focus': {
-    seedArtists: [
-      '0kbYTNQb4Pb1rPbbaF0pT4', // Miles Davis
-      '4YRxDV8wJFPHPTeXepOstw', // John Coltrane
-      '7bkg0RXqKFoSJF8KBM2oFN', // Bill Evans
-    ],
+    seedArtistNames: ['Miles Davis', 'John Coltrane', 'Bill Evans'],
     features: { target_energy: 0.3, target_valence: 0.4, target_acousticness: 0.7, target_instrumentalness: 0.7, target_tempo: 95 }
   },
   'summer': {
-    seedArtists: [
-      '5VM9TypKaZERaBf9ex28A4', // Vampire Weekend (corrected)
-      '3AA28KZvwAUcZuOKwyblJQ', // The Beach Boys
-      '5INjqkS1o8h1imAzPqGZng', // Tame Impala
-    ],
+    seedArtistNames: ['Vampire Weekend', 'The Beach Boys', 'Tame Impala'],
     features: { target_energy: 0.7, target_valence: 0.8, target_danceability: 0.65, target_tempo: 110 }
   }
 };
 
-// MARK: - Helper: get unique albums from track recommendations
-async function getAlbumsFromRecommendations(seedArtists, features, limit = 10) {
+// Cache resolved artist IDs so we don't look them up every time
+const artistIdCache = {};
+
+async function resolveArtistId(name) {
+  if (artistIdCache[name]) return artistIdCache[name];
+
+  const result = await axios.get('https://api.spotify.com/v1/search', {
+    headers: { Authorization: `Bearer ${access_token}` },
+    params: { q: name, type: 'artist', limit: 1 }
+  });
+
+  const artist = result.data.artists.items[0];
+  if (!artist) throw new Error(`Artist not found: ${name}`);
+
+  artistIdCache[name] = artist.id;
+  console.log(`✅ Resolved "${name}" → ${artist.id}`);
+  return artist.id;
+}
+
+async function getAlbumsFromRecommendations(artistNames, features, limit = 10) {
+  const seedArtistIds = await Promise.all(artistNames.map(resolveArtistId));
+
   const params = {
-    seed_artists: seedArtists.join(','),
+    seed_artists: seedArtistIds.join(','),
     limit: 20,
     ...features
   };
@@ -106,8 +100,6 @@ async function getAlbumsFromRecommendations(seedArtists, features, limit = 10) {
   });
 
   const tracks = recResponse.data.tracks;
-
-  // Deduplicate by album ID
   const seenAlbumIds = new Set();
   const uniqueAlbums = [];
 
@@ -193,7 +185,7 @@ app.get('/recommendations', async (req, res) => {
 
   try {
     const albums = await getAlbumsFromRecommendations(
-      moodConfig.seedArtists,
+      moodConfig.seedArtistNames,
       moodConfig.features
     );
     res.json(albums);
