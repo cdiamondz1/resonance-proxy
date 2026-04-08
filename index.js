@@ -85,7 +85,6 @@ async function getValidUserToken(uid) {
     return tokens.accessToken;
   }
 
-  // Token expired — refresh it
   const clientId = process.env.SPOTIFY_CLIENT_ID || process.env.CLIENT_ID;
   const clientSecret = process.env.SPOTIFY_CLIENT_SECRET || process.env.CLIENT_SECRET;
 
@@ -113,6 +112,134 @@ async function getValidUserToken(uid) {
 
   console.log(`✅ Refreshed user token for ${uid}`);
   return newAccessToken;
+}
+
+// ── Notification Helper ───────────────────────────────────────────────────────
+
+async function sendPushNotification(recipientUid, type, payload) {
+  try {
+    const userDoc = await db.collection('users').doc(recipientUid).get();
+    const fcmToken = userDoc.data()?.fcmToken;
+    if (!fcmToken) return { sent: false, reason: 'No FCM token' };
+
+    const message = buildMessage(type, payload, fcmToken);
+    if (!message) return { sent: false, reason: `Unknown type: ${type}` };
+
+    await admin.messaging().send(message);
+    console.log(`✅ Push sent [${type}] to ${recipientUid}`);
+    return { sent: true };
+  } catch (err) {
+    console.error(`❌ Push failed [${type}] to ${recipientUid}:`, err.message);
+    return { sent: false, reason: err.message };
+  }
+}
+
+function buildMessage(type, payload, token) {
+  const base = { token };
+
+  switch (type) {
+    case 'newFollower':
+      return {
+        ...base,
+        notification: {
+          title: `${payload.fromName} followed you`,
+          body: 'Tap to view their profile.'
+        },
+        data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '' }
+      };
+
+    case 'entryComment':
+      return {
+        ...base,
+        notification: {
+          title: `${payload.fromName} left a note`,
+          body: payload.albumTitle ? `on your entry for ${payload.albumTitle}` : 'on your entry'
+        },
+        data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '', entryId: payload.entryId ?? '' }
+      };
+
+    case 'commentReply':
+      return {
+        ...base,
+        notification: {
+          title: `${payload.fromName} replied to you`,
+          body: payload.albumTitle ? `on ${payload.albumTitle}` : 'on your note'
+        },
+        data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '', entryId: payload.entryId ?? '' }
+      };
+
+    case 'commentLike':
+      return {
+        ...base,
+        notification: {
+          title: `${payload.fromName} liked your note`,
+          body: payload.albumTitle ? `on ${payload.albumTitle}` : ''
+        },
+        data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '', entryId: payload.entryId ?? '' }
+      };
+
+    case 'albumSuggestion':
+      return {
+        ...base,
+        notification: {
+          title: `${payload.fromName} suggested an album`,
+          body: payload.albumTitle
+            ? `"${payload.albumTitle}" — check it out on their profile`
+            : 'Tap to see what they think you should hear.'
+        },
+        data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '' }
+      };
+
+    case 'suggestionAgree':
+      return {
+        ...base,
+        notification: {
+          title: `${payload.fromName} agrees`,
+          body: payload.albumTitle
+            ? `You should really listen to ${payload.albumTitle}`
+            : 'Someone else thinks you should hear this too.'
+        },
+        data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '' }
+      };
+
+    case 'suggestionReviewed':
+      return {
+        ...base,
+        notification: {
+          title: `${payload.authorName} finally listened`,
+          body: payload.albumTitle
+            ? `${payload.albumTitle}${payload.ratingString ? ` — ${payload.ratingString}` : ''}`
+            : 'Tap to see their entry.'
+        },
+        data: {
+          type,
+          authorUid:  payload.authorUid  ?? '',
+          authorName: payload.authorName ?? '',
+          entryId:    payload.entryId    ?? ''
+        }
+      };
+
+    case 'weeklyPrompt':
+      return {
+        ...base,
+        notification: {
+          title: "This week's prompt is here",
+          body: payload.promptText ? `"${payload.promptText}"` : 'Open Resonance to see it.'
+        },
+        data: { type, promptText: payload.promptText ?? '' }
+      };
+
+    default:
+      return null;
+  }
+}
+
+function getWeekNumber(date) {
+  const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+  const dayNum = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  return Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
 }
 
 // ── Root ──────────────────────────────────────────────────────────────────────
@@ -182,9 +309,7 @@ app.get('/artist-info', async (req, res) => {
     const result = await axios.get(`https://api.spotify.com/v1/artists/${id}`, {
       headers: { Authorization: `Bearer ${access_token}` }
     });
-    if (isHtmlResponse(result.data)) {
-      return res.status(503).json({ error: 'Proxy cold start, retry' });
-    }
+    if (isHtmlResponse(result.data)) return res.status(503).json({ error: 'Proxy cold start, retry' });
     res.json(result.data);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -201,9 +326,7 @@ app.get('/artist-albums', async (req, res) => {
       headers: { Authorization: `Bearer ${access_token}` },
       params: { include_groups: 'album', limit: 50 }
     });
-    if (isHtmlResponse(result.data)) {
-      return res.status(503).json({ error: 'Proxy cold start, retry' });
-    }
+    if (isHtmlResponse(result.data)) return res.status(503).json({ error: 'Proxy cold start, retry' });
     res.json(result.data.items);
   } catch (error) {
     console.error('❌ Artist albums fetch failed:', error.response?.data || error.message);
@@ -220,9 +343,7 @@ app.get('/album-tracks', async (req, res) => {
     const result = await axios.get(`https://api.spotify.com/v1/albums/${id}/tracks`, {
       headers: { Authorization: `Bearer ${access_token}` }
     });
-    if (isHtmlResponse(result.data)) {
-      return res.status(503).json({ error: 'Proxy cold start, retry' });
-    }
+    if (isHtmlResponse(result.data)) return res.status(503).json({ error: 'Proxy cold start, retry' });
     res.json(result.data.items);
   } catch (error) {
     console.error('❌ Album tracks fetch failed:', error.response?.data || error.message);
@@ -239,9 +360,7 @@ app.get('/album-details', async (req, res) => {
     const result = await axios.get(`https://api.spotify.com/v1/albums/${id}`, {
       headers: { Authorization: `Bearer ${access_token}` }
     });
-    if (isHtmlResponse(result.data)) {
-      return res.status(503).json({ error: 'Proxy cold start, retry' });
-    }
+    if (isHtmlResponse(result.data)) return res.status(503).json({ error: 'Proxy cold start, retry' });
     res.json(result.data);
   } catch (error) {
     console.error('❌ Album details fetch failed:', error.response?.data || error.message);
@@ -258,9 +377,7 @@ app.get('/full-album', async (req, res) => {
     const result = await axios.get(`https://api.spotify.com/v1/albums/${id}`, {
       headers: { Authorization: `Bearer ${access_token}` }
     });
-    if (isHtmlResponse(result.data)) {
-      return res.status(503).json({ error: 'Proxy cold start, retry' });
-    }
+    if (isHtmlResponse(result.data)) return res.status(503).json({ error: 'Proxy cold start, retry' });
     res.json(result.data);
   } catch (error) {
     console.error('❌ Full album fetch failed:', error.response?.data || error.message);
@@ -277,9 +394,7 @@ app.get('/artists', async (req, res) => {
     const result = await axios.get(`https://api.spotify.com/v1/artists/${id}`, {
       headers: { Authorization: `Bearer ${access_token}` }
     });
-    if (isHtmlResponse(result.data)) {
-      return res.status(503).json({ error: 'Proxy cold start, retry' });
-    }
+    if (isHtmlResponse(result.data)) return res.status(503).json({ error: 'Proxy cold start, retry' });
     res.json(result.data);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -324,9 +439,7 @@ app.get('/spotify/auth/callback', async (req, res) => {
     return res.status(400).send(`Spotify auth error: ${error}`);
   }
 
-  if (!code || !uid) {
-    return res.status(400).send('Missing code or uid');
-  }
+  if (!code || !uid) return res.status(400).send('Missing code or uid');
 
   const clientId = process.env.SPOTIFY_CLIENT_ID || process.env.CLIENT_ID;
   const clientSecret = process.env.SPOTIFY_CLIENT_SECRET || process.env.CLIENT_SECRET;
@@ -404,11 +517,8 @@ app.get('/spotify/recently-played', async (req, res) => {
       params: { limit: 50 }
     });
 
-    if (isHtmlResponse(result.data)) {
-      return res.status(503).json({ error: 'Proxy cold start, retry' });
-    }
+    if (isHtmlResponse(result.data)) return res.status(503).json({ error: 'Proxy cold start, retry' });
 
-    // Extract unique albums
     const seenAlbumIds = new Set();
     const albums = [];
 
@@ -446,20 +556,16 @@ app.get('/spotify/currently-playing', async (req, res) => {
     });
 
     if (!result.data || result.status === 204) {
-      // Nothing playing — clear currentlySpinning
       await db.collection('users').doc(uid).update({
         currentlySpinning: admin.firestore.FieldValue.delete()
       });
       return res.json({ playing: false });
     }
 
-    if (isHtmlResponse(result.data)) {
-      return res.status(503).json({ error: 'Proxy cold start, retry' });
-    }
+    if (isHtmlResponse(result.data)) return res.status(503).json({ error: 'Proxy cold start, retry' });
 
     const track = result.data.item;
     const album = track?.album;
-
     if (!album) return res.json({ playing: false });
 
     const currentlySpinning = {
@@ -472,7 +578,6 @@ app.get('/spotify/currently-playing', async (req, res) => {
     };
 
     await db.collection('users').doc(uid).update({ currentlySpinning });
-
     res.json({ playing: true, ...currentlySpinning });
   } catch (err) {
     console.error('❌ Currently playing failed:', err.response?.data || err.message);
@@ -493,10 +598,7 @@ app.get('/spotify/top-artists', async (req, res) => {
       params: { limit: 50, time_range }
     });
 
-    if (isHtmlResponse(result.data)) {
-      return res.status(503).json({ error: 'Proxy cold start, retry' });
-    }
-
+    if (isHtmlResponse(result.data)) return res.status(503).json({ error: 'Proxy cold start, retry' });
     res.json(result.data.items);
   } catch (err) {
     console.error('❌ Top artists failed:', err.response?.data || err.message);
@@ -512,18 +614,13 @@ app.post('/spotify/sync-prompts', async (req, res) => {
 
   try {
     const token = await getValidUserToken(uid);
-
-    // Fetch recently played
     const result = await axios.get('https://api.spotify.com/v1/me/player/recently-played', {
       headers: { Authorization: `Bearer ${token}` },
       params: { limit: 50 }
     });
 
-    if (isHtmlResponse(result.data)) {
-      return res.status(503).json({ error: 'Proxy cold start, retry' });
-    }
+    if (isHtmlResponse(result.data)) return res.status(503).json({ error: 'Proxy cold start, retry' });
 
-    // Get user's existing diary entries and dismissed prompts
     const [diarySnap, userDoc] = await Promise.all([
       db.collection('users').doc(uid).collection('diaryEntries').get(),
       db.collection('users').doc(uid).get()
@@ -532,17 +629,12 @@ app.post('/spotify/sync-prompts', async (req, res) => {
     const loggedAlbumIds = new Set(diarySnap.docs.map(d => d.data().albumId));
     const dismissed = new Set(userDoc.data()?.dismissedSpotifyPrompts ?? []);
 
-    // Extract unique unlogged undismissed albums
     const seenAlbumIds = new Set();
     const candidates = [];
 
     for (const item of result.data.items) {
       const album = item.track.album;
-      if (
-        !seenAlbumIds.has(album.id) &&
-        !loggedAlbumIds.has(album.id) &&
-        !dismissed.has(album.id)
-      ) {
+      if (!seenAlbumIds.has(album.id) && !loggedAlbumIds.has(album.id) && !dismissed.has(album.id)) {
         seenAlbumIds.add(album.id);
         candidates.push({
           albumId: album.id,
@@ -555,26 +647,18 @@ app.post('/spotify/sync-prompts', async (req, res) => {
       }
     }
 
-    // Limit to 10 prompts — write batch
     const limited = candidates.slice(0, 10);
     const batch = db.batch();
 
-    // Clear existing prompts first
-    const existingPrompts = await db
-      .collection('users').doc(uid)
-      .collection('spotifyPrompts').get();
-
+    const existingPrompts = await db.collection('users').doc(uid).collection('spotifyPrompts').get();
     existingPrompts.docs.forEach(d => batch.delete(d.ref));
 
-    // Write new prompts
     for (const prompt of limited) {
-      const ref = db.collection('users').doc(uid)
-        .collection('spotifyPrompts').doc(prompt.albumId);
+      const ref = db.collection('users').doc(uid).collection('spotifyPrompts').doc(prompt.albumId);
       batch.set(ref, prompt);
     }
 
     await batch.commit();
-
     console.log(`✅ Synced ${limited.length} Spotify prompts for user ${uid}`);
     res.json({ synced: limited.length });
   } catch (err) {
@@ -582,6 +666,78 @@ app.post('/spotify/sync-prompts', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ── Push Notifications ────────────────────────────────────────────────────────
+// POST /notify
+// Sends a push notification to a single recipient.
+// Body: { recipientUid, type, ...payload }
+
+app.post('/notify', async (req, res) => {
+  const { recipientUid, type, ...payload } = req.body;
+  if (!recipientUid || !type) {
+    return res.status(400).json({ error: 'Missing recipientUid or type' });
+  }
+  const result = await sendPushNotification(recipientUid, type, payload);
+  res.json(result);
+});
+
+// ── Weekly Prompt Push ────────────────────────────────────────────────────────
+// POST /notify/weekly-prompt
+// Sends the current week's prompt to all users with an FCM token.
+// Requires x-notify-secret header matching NOTIFY_SECRET env var.
+
+app.post('/notify/weekly-prompt', async (req, res) => {
+  const secret = req.headers['x-notify-secret'];
+  if (secret !== process.env.NOTIFY_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const now = new Date();
+    const year = now.getFullYear();
+    const weekNum = getWeekNumber(now);
+    const weekId = `${year}-W${String(weekNum).padStart(2, '0')}`;
+
+    const promptDoc = await db.collection('weeklyPrompts').doc(weekId).get();
+    const promptText = promptDoc.data()?.promptText;
+    if (!promptText) {
+      return res.status(404).json({ error: `No prompt found for ${weekId}` });
+    }
+
+    const usersSnap = await db.collection('users').where('fcmToken', '!=', '').get();
+    if (usersSnap.empty) return res.json({ sent: 0, reason: 'No users with FCM tokens' });
+
+    const tokens = usersSnap.docs.map(doc => doc.data().fcmToken).filter(Boolean);
+
+    // FCM multicast — max 500 tokens per call
+    const chunks = [];
+    for (let i = 0; i < tokens.length; i += 500) {
+      chunks.push(tokens.slice(i, i + 500));
+    }
+
+    let totalSent = 0;
+    for (const chunk of chunks) {
+      const multicastMessage = {
+        tokens: chunk,
+        notification: {
+          title: "This week's prompt is here",
+          body: `"${promptText}"`
+        },
+        data: { type: 'weeklyPrompt', promptText }
+      };
+      const response = await admin.messaging().sendEachForMulticast(multicastMessage);
+      totalSent += response.successCount;
+      console.log(`✅ Weekly prompt batch: ${response.successCount}/${chunk.length} sent`);
+    }
+
+    res.json({ sent: totalSent, weekId, promptText });
+  } catch (err) {
+    console.error('❌ Weekly prompt push failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
   console.log(`🚀 Resonance proxy running on port ${PORT}`);
