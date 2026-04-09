@@ -1,7 +1,6 @@
 const express = require('express');
 const cors    = require('cors');
 const axios   = require('axios');
-const https   = require('https');
 const admin   = require('firebase-admin');
 require('dotenv').config();
 
@@ -12,8 +11,13 @@ app.use(cors());
 app.use(express.json());
 
 // ── Firebase Admin ────────────────────────────────────────────────────────────
+// The private_key field in the service account JSON uses \n escape sequences
+// for newlines. When the JSON is stored as a single-line string in an env var
+// and parsed back, those sequences must be converted to real newline characters
+// otherwise the RSA key is malformed and every Admin SDK call returns a 401.
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
@@ -49,17 +53,11 @@ async function refreshToken() {
 refreshToken();
 setInterval(refreshToken, 50 * 60 * 1000);
 
-// ── Keep-alive ────────────────────────────────────────────────────────────────
-// Render free tier spins down after 10 minutes of inactivity.
-// Ping every 9 minutes to stay just inside that window.
-
-setInterval(() => {
-  https.get('https://resonance-proxy.onrender.com', (res) => {
-    console.log('🏓 Keep-alive ping:', res.statusCode);
-  }).on('error', (err) => {
-    console.log('🏓 Keep-alive error:', err.message);
-  });
-}, 9 * 60 * 1000);
+// NOTE: The keep-alive self-ping has been removed. A sleeping Render instance
+// cannot execute its own setInterval — the process is paused. Use an external
+// uptime monitor (e.g. UptimeRobot, free tier) to GET this server's root URL
+// every 5 minutes. That inbound request is what actually prevents Render from
+// spinning the instance down.
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -75,13 +73,18 @@ async function getUserTokens(uid) {
 }
 
 async function getValidUserToken(uid) {
-  const tokens    = await getUserTokens(uid);
-  const now       = Date.now();
+  const tokens = await getUserTokens(uid);
+  const now    = Date.now();
+
+  // Normalise expiresAt regardless of whether it was stored as a Firestore
+  // Timestamp or a raw millisecond number — both paths are handled.
   const expiresAt = tokens.expiresAt?.toMillis
     ? tokens.expiresAt.toMillis()
-    : tokens.expiresAt;
+    : Number(tokens.expiresAt);
 
-  if (now < expiresAt - 60000) return tokens.accessToken;
+  if (now < expiresAt - 60_000) {
+    return tokens.accessToken;
+  }
 
   const clientId     = process.env.SPOTIFY_CLIENT_ID     || process.env.CLIENT_ID;
   const clientSecret = process.env.SPOTIFY_CLIENT_SECRET || process.env.CLIENT_SECRET;
@@ -101,64 +104,50 @@ async function getValidUserToken(uid) {
   );
 
   const newAccessToken = response.data.access_token;
-  const newExpiresAt   = admin.firestore.Timestamp.fromMillis(now + response.data.expires_in * 1000);
+  const newExpiresAt   = admin.firestore.Timestamp.fromMillis(
+    now + response.data.expires_in * 1000
+  );
 
   await db.collection('users').doc(uid).update({
     'spotifyTokens.accessToken': newAccessToken,
     'spotifyTokens.expiresAt':   newExpiresAt
   });
 
-  console.log(`✅ Refreshed user Spotify token for ${uid}`);
+  console.log(`✅ Refreshed Spotify user token for ${uid}`);
   return newAccessToken;
 }
 
-// ── Notification helpers ──────────────────────────────────────────────────────
+// ── Notification Helpers ──────────────────────────────────────────────────────
 
-// Base APNs config — badge intentionally omitted until a proper unread counter
-// is built. Hardcoding badge: 1 would freeze the badge at 1 forever and never
-// clear it. Re-add once Firestore-backed badge management is in place.
-const apns = {
+// Badge count is intentionally omitted — hardcoding 1 means it never increments
+// or clears correctly. Badge management should be handled client-side via
+// UNUserNotificationCenter, or via a dedicated unread-count field in Firestore.
+const apnsBase = {
   payload: { aps: { sound: 'default' } }
 };
 
 async function sendPushNotification(recipientUid, type, payload) {
-  try {
-    const userDoc  = await db.collection('users').doc(recipientUid).get();
-    const fcmToken = userDoc.data()?.fcmToken;
+  const userDoc  = await db.collection('users').doc(recipientUid).get();
+  const fcmToken = userDoc.data()?.fcmToken;
 
-    if (!fcmToken) {
-      console.log(`⚠️ No FCM token for ${recipientUid}`);
-      return { sent: false, reason: 'No FCM token' };
-    }
-
-    const message = buildMessage(type, payload, fcmToken);
-    if (!message) return { sent: false, reason: `Unknown type: ${type}` };
-
-    const result = await admin.messaging().send(message);
-    console.log(`✅ Push sent [${type}] to ${recipientUid}: ${result}`);
-    return { sent: true };
-
-  } catch (err) {
-    // If the token is no longer valid, purge it from Firestore so we stop
-    // attempting delivery to a dead token on every subsequent event.
-    const staleTokenCodes = [
-      'messaging/registration-token-not-registered',
-      'messaging/invalid-registration-token'
-    ];
-    if (staleTokenCodes.includes(err.code)) {
-      console.warn(`🗑 Stale FCM token for ${recipientUid} — removing`);
-      await db.collection('users').doc(recipientUid).update({
-        fcmToken: admin.firestore.FieldValue.delete()
-      }).catch(() => {}); // best-effort, don't surface a secondary error
-    } else {
-      console.error(`❌ Push failed [${type}] to ${recipientUid}:`, err.message);
-    }
-    return { sent: false, reason: err.message };
+  if (!fcmToken) {
+    console.log(`⚠️ No FCM token for ${recipientUid}`);
+    return { sent: false, reason: 'No FCM token' };
   }
+
+  const message = buildMessage(type, payload, fcmToken);
+  if (!message) {
+    console.log(`⚠️ Unknown notification type: ${type}`);
+    return { sent: false, reason: `Unknown type: ${type}` };
+  }
+
+  const result = await admin.messaging().send(message);
+  console.log(`✅ Push sent [${type}] to ${recipientUid}: ${result}`);
+  return { sent: true };
 }
 
 function buildMessage(type, payload, token) {
-  const base = { token, apns };
+  const base = { token, apns: apnsBase };
 
   switch (type) {
     case 'newFollower':
@@ -168,7 +157,11 @@ function buildMessage(type, payload, token) {
           title: `${payload.fromName} followed you`,
           body:  'Tap to view their profile.'
         },
-        data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '' }
+        data: {
+          type,
+          fromUid:  payload.fromUid  ?? '',
+          fromName: payload.fromName ?? ''
+        }
       };
 
     case 'entryComment':
@@ -285,20 +278,7 @@ function getWeekNumber(date) {
   const dayNum = d.getUTCDay() || 7;
   d.setUTCDate(d.getUTCDate() + 4 - dayNum);
   const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
-  return Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
-}
-
-// ── Auth middleware ───────────────────────────────────────────────────────────
-// Validates that the caller is the Resonance app by checking a shared secret
-// stored in the NOTIFY_SECRET env var. Applied to all notification endpoints.
-// The iOS client must send this header on every /notify request.
-
-function requireNotifySecret(req, res, next) {
-  const secret = req.headers['x-notify-secret'];
-  if (!secret || secret !== process.env.NOTIFY_SECRET) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  next();
+  return Math.ceil((((d - yearStart) / 86_400_000) + 1) / 7);
 }
 
 // ── Root ──────────────────────────────────────────────────────────────────────
@@ -335,19 +315,15 @@ app.get('/test-token', async (req, res) => {
 app.get('/search', async (req, res) => {
   const { q, type = 'album' } = req.query;
   if (!q) return res.status(400).json({ error: 'Missing search query' });
-
   try {
     const result = await axios.get('https://api.spotify.com/v1/search', {
       headers: { Authorization: `Bearer ${access_token}` },
       params:  { q, type }
     });
-
     if (isHtmlResponse(result.data)) return res.status(503).json({ error: 'Proxy cold start, retry' });
-
-    if (type === 'album')       return res.json(result.data.albums.items);
-    if (type === 'artist')      return res.json(result.data.artists.items);
-    return res.status(400).json({ error: `Unsupported type: ${type}` });
-
+    if (type === 'album')       res.json(result.data.albums.items);
+    else if (type === 'artist') res.json(result.data.artists.items);
+    else res.status(400).json({ error: `Unsupported type: ${type}` });
   } catch (error) {
     console.error('🔍 Search failed:', error.response?.data || error.message);
     res.status(500).json({ error: error.response?.data || error.message });
@@ -355,7 +331,8 @@ app.get('/search', async (req, res) => {
 });
 
 // ── Artist ────────────────────────────────────────────────────────────────────
-// Consolidated from the duplicate /artist-info and /artists routes.
+// Consolidated from /artist-info and /artists — both were identical.
+// Update any Swift call sites from /artist-info or /artists to /artist.
 
 app.get('/artist', async (req, res) => {
   const { id } = req.query;
@@ -370,11 +347,6 @@ app.get('/artist', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
-
-// Keep legacy routes alive so existing client calls don't break while you
-// migrate callers to /artist.
-app.get('/artist-info',  (req, res) => res.redirect(307, `/artist?${new URLSearchParams(req.query)}`));
-app.get('/artists',      (req, res) => res.redirect(307, `/artist?${new URLSearchParams(req.query)}`));
 
 // ── Artist Albums ─────────────────────────────────────────────────────────────
 
@@ -395,7 +367,8 @@ app.get('/artist-albums', async (req, res) => {
 });
 
 // ── Album ─────────────────────────────────────────────────────────────────────
-// Consolidated from the duplicate /album-details and /full-album routes.
+// Consolidated from /album-details and /full-album — both were identical.
+// Update any Swift call sites from /album-details or /full-album to /album.
 
 app.get('/album', async (req, res) => {
   const { id } = req.query;
@@ -411,12 +384,6 @@ app.get('/album', async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch album' });
   }
 });
-
-// Keep legacy routes alive during migration.
-app.get('/album-details', (req, res) => res.redirect(307, `/album?${new URLSearchParams(req.query)}`));
-app.get('/full-album',    (req, res) => res.redirect(307, `/album?${new URLSearchParams(req.query)}`));
-
-// ── Album Tracks ──────────────────────────────────────────────────────────────
 
 app.get('/album-tracks', async (req, res) => {
   const { id } = req.query;
@@ -439,9 +406,9 @@ app.get('/spotify/auth/url', (req, res) => {
   const { uid } = req.query;
   if (!uid) return res.status(400).json({ error: 'Missing uid' });
 
-  const clientId     = process.env.SPOTIFY_CLIENT_ID || process.env.CLIENT_ID;
-  const redirectUri  = 'https://resonance-proxy.onrender.com/spotify/auth/callback';
-  const scopes       = [
+  const clientId    = process.env.SPOTIFY_CLIENT_ID || process.env.CLIENT_ID;
+  const redirectUri = 'https://resonance-proxy.onrender.com/spotify/auth/callback';
+  const scopes = [
     'user-read-recently-played',
     'user-top-read',
     'user-read-currently-playing',
@@ -463,9 +430,8 @@ app.get('/spotify/auth/url', (req, res) => {
 
 app.get('/spotify/auth/callback', async (req, res) => {
   const { code, state: uid, error } = req.query;
-
-  if (error)          return res.status(400).send(`Spotify auth error: ${error}`);
-  if (!code || !uid)  return res.status(400).send('Missing code or uid');
+  if (error) return res.status(400).send(`Spotify auth error: ${error}`);
+  if (!code || !uid) return res.status(400).send('Missing code or uid');
 
   const clientId     = process.env.SPOTIFY_CLIENT_ID     || process.env.CLIENT_ID;
   const clientSecret = process.env.SPOTIFY_CLIENT_SECRET || process.env.CLIENT_SECRET;
@@ -511,7 +477,6 @@ app.get('/spotify/auth/callback', async (req, res) => {
 app.post('/spotify/auth/disconnect', async (req, res) => {
   const { uid } = req.body;
   if (!uid) return res.status(400).json({ error: 'Missing uid' });
-
   try {
     await db.collection('users').doc(uid).update({
       spotifyTokens:     admin.firestore.FieldValue.delete(),
@@ -531,19 +496,16 @@ app.post('/spotify/auth/disconnect', async (req, res) => {
 app.get('/spotify/recently-played', async (req, res) => {
   const { uid } = req.query;
   if (!uid) return res.status(400).json({ error: 'Missing uid' });
-
   try {
     const token  = await getValidUserToken(uid);
     const result = await axios.get('https://api.spotify.com/v1/me/player/recently-played', {
       headers: { Authorization: `Bearer ${token}` },
       params:  { limit: 50 }
     });
-
     if (isHtmlResponse(result.data)) return res.status(503).json({ error: 'Proxy cold start, retry' });
 
     const seenAlbumIds = new Set();
-    const albums       = [];
-
+    const albums = [];
     for (const item of result.data.items) {
       const album = item.track.album;
       if (!seenAlbumIds.has(album.id)) {
@@ -557,7 +519,6 @@ app.get('/spotify/recently-played', async (req, res) => {
         });
       }
     }
-
     res.json(albums);
   } catch (err) {
     console.error('❌ Recently played failed:', err.response?.data || err.message);
@@ -570,7 +531,6 @@ app.get('/spotify/recently-played', async (req, res) => {
 app.get('/spotify/currently-playing', async (req, res) => {
   const { uid } = req.query;
   if (!uid) return res.status(400).json({ error: 'Missing uid' });
-
   try {
     const token  = await getValidUserToken(uid);
     const result = await axios.get('https://api.spotify.com/v1/me/player/currently-playing', {
@@ -612,14 +572,12 @@ app.get('/spotify/currently-playing', async (req, res) => {
 app.get('/spotify/top-artists', async (req, res) => {
   const { uid, time_range = 'medium_term' } = req.query;
   if (!uid) return res.status(400).json({ error: 'Missing uid' });
-
   try {
     const token  = await getValidUserToken(uid);
     const result = await axios.get('https://api.spotify.com/v1/me/top/artists', {
       headers: { Authorization: `Bearer ${token}` },
       params:  { limit: 50, time_range }
     });
-
     if (isHtmlResponse(result.data)) return res.status(503).json({ error: 'Proxy cold start, retry' });
     res.json(result.data.items);
   } catch (err) {
@@ -633,14 +591,12 @@ app.get('/spotify/top-artists', async (req, res) => {
 app.post('/spotify/sync-prompts', async (req, res) => {
   const { uid } = req.body;
   if (!uid) return res.status(400).json({ error: 'Missing uid' });
-
   try {
     const token  = await getValidUserToken(uid);
     const result = await axios.get('https://api.spotify.com/v1/me/player/recently-played', {
       headers: { Authorization: `Bearer ${token}` },
       params:  { limit: 50 }
     });
-
     if (isHtmlResponse(result.data)) return res.status(503).json({ error: 'Proxy cold start, retry' });
 
     const [diarySnap, userDoc] = await Promise.all([
@@ -653,7 +609,6 @@ app.post('/spotify/sync-prompts', async (req, res) => {
 
     const seenAlbumIds = new Set();
     const candidates   = [];
-
     for (const item of result.data.items) {
       const album = item.track.album;
       if (!seenAlbumIds.has(album.id) && !loggedAlbumIds.has(album.id) && !dismissed.has(album.id)) {
@@ -671,7 +626,6 @@ app.post('/spotify/sync-prompts', async (req, res) => {
 
     const limited = candidates.slice(0, 10);
     const batch   = db.batch();
-
     const existingPrompts = await db.collection('users').doc(uid).collection('spotifyPrompts').get();
     existingPrompts.docs.forEach(d => batch.delete(d.ref));
     for (const prompt of limited) {
@@ -680,7 +634,7 @@ app.post('/spotify/sync-prompts', async (req, res) => {
     }
 
     await batch.commit();
-    console.log(`✅ Synced ${limited.length} Spotify prompts for ${uid}`);
+    console.log(`✅ Synced ${limited.length} Spotify prompts for user ${uid}`);
     res.json({ synced: limited.length });
   } catch (err) {
     console.error('❌ Sync prompts failed:', err.response?.data || err.message);
@@ -689,22 +643,28 @@ app.post('/spotify/sync-prompts', async (req, res) => {
 });
 
 // ── Push Notifications ────────────────────────────────────────────────────────
-// Protected by x-notify-secret header. The iOS client must send this on every
-// request. Add NOTIFY_SECRET to your Render environment variables, then add the
-// same value to your app via an xcconfig or Info.plist key — never hardcode it.
 
-app.post('/notify', requireNotifySecret, async (req, res) => {
+app.post('/notify', async (req, res) => {
   const { recipientUid, type, ...payload } = req.body;
   if (!recipientUid || !type) {
     return res.status(400).json({ error: 'Missing recipientUid or type' });
   }
-  const result = await sendPushNotification(recipientUid, type, payload);
-  res.json(result);
+  try {
+    const result = await sendPushNotification(recipientUid, type, payload);
+    res.json(result);
+  } catch (err) {
+    console.error(`❌ /notify unhandled error [${type}] → ${recipientUid}:`, err.message);
+    res.status(500).json({ sent: false, reason: err.message });
+  }
 });
 
 // ── Weekly Prompt Push ────────────────────────────────────────────────────────
 
-app.post('/notify/weekly-prompt', requireNotifySecret, async (req, res) => {
+app.post('/notify/weekly-prompt', async (req, res) => {
+  const secret = req.headers['x-notify-secret'];
+  if (secret !== process.env.NOTIFY_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
   try {
     const now     = new Date();
     const weekNum = getWeekNumber(now);
