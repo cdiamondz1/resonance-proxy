@@ -53,11 +53,18 @@ async function refreshToken() {
 refreshToken();
 setInterval(refreshToken, 50 * 60 * 1000);
 
-// NOTE: The keep-alive self-ping has been removed. A sleeping Render instance
-// cannot execute its own setInterval — the process is paused. Use an external
-// uptime monitor (e.g. UptimeRobot, free tier) to GET this server's root URL
-// every 5 minutes. That inbound request is what actually prevents Render from
-// spinning the instance down.
+// ── Keep-alive ────────────────────────────────────────────────────────────────
+// Render free tier spins down after 10 minutes of inactivity.
+// Ping every 9 minutes to stay just inside that window.
+
+setInterval(() => {
+  const https = require('https');
+  https.get('https://resonance-proxy.onrender.com', (res) => {
+    console.log('🏓 Keep-alive ping:', res.statusCode);
+  }).on('error', (err) => {
+    console.log('🏓 Keep-alive error:', err.message);
+  });
+}, 9 * 60 * 1000);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -75,16 +82,11 @@ async function getUserTokens(uid) {
 async function getValidUserToken(uid) {
   const tokens = await getUserTokens(uid);
   const now    = Date.now();
-
-  // Normalise expiresAt regardless of whether it was stored as a Firestore
-  // Timestamp or a raw millisecond number — both paths are handled.
   const expiresAt = tokens.expiresAt?.toMillis
     ? tokens.expiresAt.toMillis()
     : Number(tokens.expiresAt);
 
-  if (now < expiresAt - 60_000) {
-    return tokens.accessToken;
-  }
+  if (now < expiresAt - 60_000) return tokens.accessToken;
 
   const clientId     = process.env.SPOTIFY_CLIENT_ID     || process.env.CLIENT_ID;
   const clientSecret = process.env.SPOTIFY_CLIENT_SECRET || process.env.CLIENT_SECRET;
@@ -104,9 +106,7 @@ async function getValidUserToken(uid) {
   );
 
   const newAccessToken = response.data.access_token;
-  const newExpiresAt   = admin.firestore.Timestamp.fromMillis(
-    now + response.data.expires_in * 1000
-  );
+  const newExpiresAt   = admin.firestore.Timestamp.fromMillis(now + response.data.expires_in * 1000);
 
   await db.collection('users').doc(uid).update({
     'spotifyTokens.accessToken': newAccessToken,
@@ -119,9 +119,6 @@ async function getValidUserToken(uid) {
 
 // ── Notification Helpers ──────────────────────────────────────────────────────
 
-// Badge count is intentionally omitted — hardcoding 1 means it never increments
-// or clears correctly. Badge management should be handled client-side via
-// UNUserNotificationCenter, or via a dedicated unread-count field in Firestore.
 const apnsBase = {
   payload: { aps: { sound: 'default' } }
 };
@@ -141,9 +138,26 @@ async function sendPushNotification(recipientUid, type, payload) {
     return { sent: false, reason: `Unknown type: ${type}` };
   }
 
-  const result = await admin.messaging().send(message);
-  console.log(`✅ Push sent [${type}] to ${recipientUid}: ${result}`);
-  return { sent: true };
+  try {
+    const result = await admin.messaging().send(message);
+    console.log(`✅ Push sent [${type}] to ${recipientUid}: ${result}`);
+    return { sent: true };
+  } catch (err) {
+    // Purge stale tokens so we stop attempting delivery to dead registrations.
+    const staleCodes = [
+      'messaging/registration-token-not-registered',
+      'messaging/invalid-registration-token'
+    ];
+    if (staleCodes.includes(err.code)) {
+      console.warn(`🗑 Stale FCM token for ${recipientUid} — removing`);
+      await db.collection('users').doc(recipientUid)
+        .update({ fcmToken: admin.firestore.FieldValue.delete() })
+        .catch(() => {});
+    } else {
+      console.error(`❌ Push failed [${type}] to ${recipientUid}:`, err.message, err.code);
+    }
+    return { sent: false, reason: err.message };
+  }
 }
 
 function buildMessage(type, payload, token) {
@@ -153,17 +167,9 @@ function buildMessage(type, payload, token) {
     case 'newFollower':
       return {
         ...base,
-        notification: {
-          title: `${payload.fromName} followed you`,
-          body:  'Tap to view their profile.'
-        },
-        data: {
-          type,
-          fromUid:  payload.fromUid  ?? '',
-          fromName: payload.fromName ?? ''
-        }
+        notification: { title: `${payload.fromName} followed you`, body: 'Tap to view their profile.' },
+        data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '' }
       };
-
     case 'entryComment':
       return {
         ...base,
@@ -171,14 +177,8 @@ function buildMessage(type, payload, token) {
           title: `${payload.fromName} left a note`,
           body:  payload.albumTitle ? `on your entry for ${payload.albumTitle}` : 'on your entry'
         },
-        data: {
-          type,
-          fromUid:  payload.fromUid  ?? '',
-          fromName: payload.fromName ?? '',
-          entryId:  payload.entryId  ?? ''
-        }
+        data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '', entryId: payload.entryId ?? '' }
       };
-
     case 'commentReply':
       return {
         ...base,
@@ -186,14 +186,8 @@ function buildMessage(type, payload, token) {
           title: `${payload.fromName} replied to you`,
           body:  payload.albumTitle ? `on ${payload.albumTitle}` : 'on your note'
         },
-        data: {
-          type,
-          fromUid:  payload.fromUid  ?? '',
-          fromName: payload.fromName ?? '',
-          entryId:  payload.entryId  ?? ''
-        }
+        data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '', entryId: payload.entryId ?? '' }
       };
-
     case 'commentLike':
       return {
         ...base,
@@ -201,63 +195,35 @@ function buildMessage(type, payload, token) {
           title: `${payload.fromName} liked your note`,
           body:  payload.albumTitle ? `on ${payload.albumTitle}` : ''
         },
-        data: {
-          type,
-          fromUid:  payload.fromUid  ?? '',
-          fromName: payload.fromName ?? '',
-          entryId:  payload.entryId  ?? ''
-        }
+        data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '', entryId: payload.entryId ?? '' }
       };
-
     case 'albumSuggestion':
       return {
         ...base,
         notification: {
           title: `${payload.fromName} suggested an album`,
-          body:  payload.albumTitle
-            ? `"${payload.albumTitle}" — check it out on their profile`
-            : 'Tap to see what they think you should hear.'
+          body:  payload.albumTitle ? `"${payload.albumTitle}" — check it out on their profile` : 'Tap to see what they think you should hear.'
         },
-        data: {
-          type,
-          fromUid:  payload.fromUid  ?? '',
-          fromName: payload.fromName ?? ''
-        }
+        data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '' }
       };
-
     case 'suggestionAgree':
       return {
         ...base,
         notification: {
           title: `${payload.fromName} agrees`,
-          body:  payload.albumTitle
-            ? `You should really listen to ${payload.albumTitle}`
-            : 'Someone else thinks you should hear this too.'
+          body:  payload.albumTitle ? `You should really listen to ${payload.albumTitle}` : 'Someone else thinks you should hear this too.'
         },
-        data: {
-          type,
-          fromUid:  payload.fromUid  ?? '',
-          fromName: payload.fromName ?? ''
-        }
+        data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '' }
       };
-
     case 'suggestionReviewed':
       return {
         ...base,
         notification: {
           title: `${payload.authorName} finally listened`,
-          body:  payload.albumTitle
-            ? `${payload.albumTitle}${payload.ratingString ? ` — ${payload.ratingString}` : ''}`
-            : 'Tap to see their entry.'
+          body:  payload.albumTitle ? `${payload.albumTitle}${payload.ratingString ? ` — ${payload.ratingString}` : ''}` : 'Tap to see their entry.'
         },
-        data: {
-          type,
-          authorUid:  payload.authorUid  ?? '',
-          authorName: payload.authorName ?? '',
-          entryId:    payload.entryId    ?? ''
-        }
+        data: { type, authorUid: payload.authorUid ?? '', authorName: payload.authorName ?? '', entryId: payload.entryId ?? '' }
       };
-
     case 'weeklyPrompt':
       return {
         ...base,
@@ -267,7 +233,6 @@ function buildMessage(type, payload, token) {
         },
         data: { type, promptText: payload.promptText ?? '' }
       };
-
     default:
       return null;
   }
@@ -281,13 +246,23 @@ function getWeekNumber(date) {
   return Math.ceil((((d - yearStart) / 86_400_000) + 1) / 7);
 }
 
+// ── Auth middleware ───────────────────────────────────────────────────────────
+
+function requireNotifySecret(req, res, next) {
+  const secret = req.headers['x-notify-secret'];
+  if (!secret || secret !== process.env.NOTIFY_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+}
+
 // ── Root ──────────────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => {
   res.send('🎵 Resonance proxy is live');
 });
 
-// ── Debug token ───────────────────────────────────────────────────────────────
+// ── Debug: Spotify token ──────────────────────────────────────────────────────
 
 app.get('/test-token', async (req, res) => {
   const clientId     = process.env.SPOTIFY_CLIENT_ID     || process.env.CLIENT_ID;
@@ -307,6 +282,27 @@ app.get('/test-token', async (req, res) => {
     res.send(response.data);
   } catch (error) {
     res.status(500).json({ error: error.response?.data || error.message });
+  }
+});
+
+// ── Debug: FCM send ───────────────────────────────────────────────────────────
+// Temporary diagnostic endpoint — remove before App Store submission.
+// Tests whether Firebase Admin can authenticate and send to FCM at all,
+// bypassing Firestore token lookup. Call with:
+//   curl https://resonance-proxy.onrender.com/test-fcm?token=YOUR_FCM_TOKEN
+
+app.get('/test-fcm', async (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ error: 'Missing token query param' });
+  try {
+    const result = await admin.messaging().send({
+      token,
+      notification: { title: 'Resonance', body: 'Push is working 🎵' },
+      apns: { payload: { aps: { sound: 'default' } } }
+    });
+    res.json({ ok: true, result });
+  } catch (err) {
+    res.json({ ok: false, error: err.message, code: err.code });
   }
 });
 
@@ -331,8 +327,6 @@ app.get('/search', async (req, res) => {
 });
 
 // ── Artist ────────────────────────────────────────────────────────────────────
-// Consolidated from /artist-info and /artists — both were identical.
-// Update any Swift call sites from /artist-info or /artists to /artist.
 
 app.get('/artist', async (req, res) => {
   const { id } = req.query;
@@ -347,6 +341,10 @@ app.get('/artist', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// Legacy redirects — keep until all Swift call sites are updated to /artist
+app.get('/artist-info', (req, res) => res.redirect(307, `/artist?${new URLSearchParams(req.query)}`));
+app.get('/artists',     (req, res) => res.redirect(307, `/artist?${new URLSearchParams(req.query)}`));
 
 // ── Artist Albums ─────────────────────────────────────────────────────────────
 
@@ -367,8 +365,6 @@ app.get('/artist-albums', async (req, res) => {
 });
 
 // ── Album ─────────────────────────────────────────────────────────────────────
-// Consolidated from /album-details and /full-album — both were identical.
-// Update any Swift call sites from /album-details or /full-album to /album.
 
 app.get('/album', async (req, res) => {
   const { id } = req.query;
@@ -384,6 +380,12 @@ app.get('/album', async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch album' });
   }
 });
+
+// Legacy redirects
+app.get('/album-details', (req, res) => res.redirect(307, `/album?${new URLSearchParams(req.query)}`));
+app.get('/full-album',    (req, res) => res.redirect(307, `/album?${new URLSearchParams(req.query)}`));
+
+// ── Album Tracks ──────────────────────────────────────────────────────────────
 
 app.get('/album-tracks', async (req, res) => {
   const { id } = req.query;
@@ -405,7 +407,6 @@ app.get('/album-tracks', async (req, res) => {
 app.get('/spotify/auth/url', (req, res) => {
   const { uid } = req.query;
   if (!uid) return res.status(400).json({ error: 'Missing uid' });
-
   const clientId    = process.env.SPOTIFY_CLIENT_ID || process.env.CLIENT_ID;
   const redirectUri = 'https://resonance-proxy.onrender.com/spotify/auth/callback';
   const scopes = [
@@ -414,7 +415,6 @@ app.get('/spotify/auth/url', (req, res) => {
     'user-read-currently-playing',
     'user-read-playback-state'
   ].join(' ');
-
   const params = new URLSearchParams({
     response_type: 'code',
     client_id:     clientId,
@@ -422,7 +422,6 @@ app.get('/spotify/auth/url', (req, res) => {
     redirect_uri:  redirectUri,
     state:         uid
   });
-
   res.json({ url: `https://accounts.spotify.com/authorize?${params.toString()}` });
 });
 
@@ -430,13 +429,11 @@ app.get('/spotify/auth/url', (req, res) => {
 
 app.get('/spotify/auth/callback', async (req, res) => {
   const { code, state: uid, error } = req.query;
-  if (error) return res.status(400).send(`Spotify auth error: ${error}`);
+  if (error)         return res.status(400).send(`Spotify auth error: ${error}`);
   if (!code || !uid) return res.status(400).send('Missing code or uid');
-
   const clientId     = process.env.SPOTIFY_CLIENT_ID     || process.env.CLIENT_ID;
   const clientSecret = process.env.SPOTIFY_CLIENT_SECRET || process.env.CLIENT_SECRET;
   const redirectUri  = 'https://resonance-proxy.onrender.com/spotify/auth/callback';
-
   try {
     const response = await axios.post(
       'https://accounts.spotify.com/api/token',
@@ -448,15 +445,12 @@ app.get('/spotify/auth/callback', async (req, res) => {
         }
       }
     );
-
     const { access_token: accessToken, refresh_token: refreshToken, expires_in } = response.data;
     const expiresAt = admin.firestore.Timestamp.fromMillis(Date.now() + expires_in * 1000);
-
     await db.collection('users').doc(uid).update({
       spotifyTokens:    { accessToken, refreshToken, expiresAt },
       spotifyConnected: true
     });
-
     console.log(`✅ Spotify connected for user ${uid}`);
     res.send(`
       <html>
@@ -503,7 +497,6 @@ app.get('/spotify/recently-played', async (req, res) => {
       params:  { limit: 50 }
     });
     if (isHtmlResponse(result.data)) return res.status(503).json({ error: 'Proxy cold start, retry' });
-
     const seenAlbumIds = new Set();
     const albums = [];
     for (const item of result.data.items) {
@@ -536,20 +529,14 @@ app.get('/spotify/currently-playing', async (req, res) => {
     const result = await axios.get('https://api.spotify.com/v1/me/player/currently-playing', {
       headers: { Authorization: `Bearer ${token}` }
     });
-
     if (!result.data || result.status === 204) {
-      await db.collection('users').doc(uid).update({
-        currentlySpinning: admin.firestore.FieldValue.delete()
-      });
+      await db.collection('users').doc(uid).update({ currentlySpinning: admin.firestore.FieldValue.delete() });
       return res.json({ playing: false });
     }
-
     if (isHtmlResponse(result.data)) return res.status(503).json({ error: 'Proxy cold start, retry' });
-
     const track = result.data.item;
     const album = track?.album;
     if (!album) return res.json({ playing: false });
-
     const currentlySpinning = {
       albumId:       album.id,
       albumTitle:    album.name,
@@ -558,7 +545,6 @@ app.get('/spotify/currently-playing', async (req, res) => {
       trackTitle:    track.name,
       updatedAt:     admin.firestore.Timestamp.now()
     };
-
     await db.collection('users').doc(uid).update({ currentlySpinning });
     res.json({ playing: true, ...currentlySpinning });
   } catch (err) {
@@ -598,15 +584,12 @@ app.post('/spotify/sync-prompts', async (req, res) => {
       params:  { limit: 50 }
     });
     if (isHtmlResponse(result.data)) return res.status(503).json({ error: 'Proxy cold start, retry' });
-
     const [diarySnap, userDoc] = await Promise.all([
       db.collection('users').doc(uid).collection('diaryEntries').get(),
       db.collection('users').doc(uid).get()
     ]);
-
     const loggedAlbumIds = new Set(diarySnap.docs.map(d => d.data().albumId));
     const dismissed      = new Set(userDoc.data()?.dismissedSpotifyPrompts ?? []);
-
     const seenAlbumIds = new Set();
     const candidates   = [];
     for (const item of result.data.items) {
@@ -623,7 +606,6 @@ app.post('/spotify/sync-prompts', async (req, res) => {
         });
       }
     }
-
     const limited = candidates.slice(0, 10);
     const batch   = db.batch();
     const existingPrompts = await db.collection('users').doc(uid).collection('spotifyPrompts').get();
@@ -632,7 +614,6 @@ app.post('/spotify/sync-prompts', async (req, res) => {
       const ref = db.collection('users').doc(uid).collection('spotifyPrompts').doc(prompt.albumId);
       batch.set(ref, prompt);
     }
-
     await batch.commit();
     console.log(`✅ Synced ${limited.length} Spotify prompts for user ${uid}`);
     res.json({ synced: limited.length });
@@ -644,7 +625,7 @@ app.post('/spotify/sync-prompts', async (req, res) => {
 
 // ── Push Notifications ────────────────────────────────────────────────────────
 
-app.post('/notify', async (req, res) => {
+app.post('/notify', requireNotifySecret, async (req, res) => {
   const { recipientUid, type, ...payload } = req.body;
   if (!recipientUid || !type) {
     return res.status(400).json({ error: 'Missing recipientUid or type' });
@@ -660,44 +641,30 @@ app.post('/notify', async (req, res) => {
 
 // ── Weekly Prompt Push ────────────────────────────────────────────────────────
 
-app.post('/notify/weekly-prompt', async (req, res) => {
-  const secret = req.headers['x-notify-secret'];
-  if (secret !== process.env.NOTIFY_SECRET) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+app.post('/notify/weekly-prompt', requireNotifySecret, async (req, res) => {
   try {
     const now     = new Date();
     const weekNum = getWeekNumber(now);
     const weekId  = `${now.getFullYear()}-W${String(weekNum).padStart(2, '0')}`;
-
     const promptDoc  = await db.collection('weeklyPrompts').doc(weekId).get();
     const promptText = promptDoc.data()?.promptText;
-    if (!promptText) {
-      return res.status(404).json({ error: `No prompt found for ${weekId}` });
-    }
-
+    if (!promptText) return res.status(404).json({ error: `No prompt found for ${weekId}` });
     const usersSnap = await db.collection('users').where('fcmToken', '!=', '').get();
     if (usersSnap.empty) return res.json({ sent: 0, reason: 'No users with FCM tokens' });
-
     const tokens = usersSnap.docs.map(doc => doc.data().fcmToken).filter(Boolean);
     const chunks = [];
     for (let i = 0; i < tokens.length; i += 500) chunks.push(tokens.slice(i, i + 500));
-
     let totalSent = 0;
     for (const chunk of chunks) {
       const response = await admin.messaging().sendEachForMulticast({
         tokens: chunk,
-        notification: {
-          title: "This week's prompt is here",
-          body:  `"${promptText}"`
-        },
+        notification: { title: "This week's prompt is here", body: `"${promptText}"` },
         data: { type: 'weeklyPrompt', promptText },
         apns: { payload: { aps: { sound: 'default' } } }
       });
       totalSent += response.successCount;
       console.log(`✅ Weekly prompt batch: ${response.successCount}/${chunk.length} sent`);
     }
-
     res.json({ sent: totalSent, weekId, promptText });
   } catch (err) {
     console.error('❌ Weekly prompt push failed:', err.message);
