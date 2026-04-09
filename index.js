@@ -769,7 +769,8 @@ app.post('/notify/weekly-prompt', async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`🚀 Resonance proxy running on port ${PORT}`);
-});}, 14 * 60 * 1000);
+});
+}, 14 * 60 * 1000);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
