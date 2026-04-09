@@ -145,7 +145,8 @@ function buildMessage(type, payload, token) {
           title: `${payload.fromName} followed you`,
           body: 'Tap to view their profile.'
         },
-        data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '' }
+        data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '' },
+        apns: { payload: { aps: { sound: 'default', badge: 1 } } }
       };
 
     case 'entryComment':
