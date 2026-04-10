@@ -387,90 +387,197 @@ app.post('/spotify/sync-prompts', async (req, res) => {
   } catch (err) { console.error('❌ Sync prompts failed:', err.response?.data || err.message); res.status(500).json({ error: err.message }); }
 });
 
-// ── Cold Read — Taste-Based Random Album ──────────────────────────────────────
-// Seeds recommendations from top artists across all three time ranges plus top
-// tracks. Runs up to 4 seed combinations in parallel for maximum variety.
+// ── Cold Read — Taste Map Centroid Album ──────────────────────────────────────
+// Primary path (≥8 scored entries): computes taste map centroid from diary
+// entries, maps to Spotify genre seeds by quadrant, runs 4 recommendation
+// combinations in parallel.
+// Fallback (<8 scored entries): seeds from top artists across all time ranges.
+
+const GENRE_SEEDS_BY_QUADRANT = {
+  emotional_accessible: [
+    'pop', 'soul', 'r-n-b', 'dance', 'funk',
+    'indie-pop', 'synth-pop', 'pop-rock', 'disco', 'reggaeton'
+  ],
+  emotional_challenging: [
+    'experimental', 'post-punk', 'noise', 'shoegaze', 'art-rock',
+    'avant-garde', 'psychedelic', 'industrial', 'darkwave', 'emo'
+  ],
+  intellectual_accessible: [
+    'alternative', 'indie', 'folk', 'singer-songwriter', 'acoustic',
+    'chamber-pop', 'dream-pop', 'new-wave', 'soft-rock', 'americana'
+  ],
+  intellectual_challenging: [
+    'jazz', 'classical', 'progressive-rock', 'post-rock', 'ambient',
+    'avant-garde-jazz', 'math-rock', 'krautrock', 'drone', 'black-metal'
+  ]
+};
+
+const SPOTIFY_GENRE_MAP = {
+  'avant-garde':       'ambient',
+  'avant-garde-jazz':  'jazz',
+  'chamber-pop':       'indie',
+  'math-rock':         'alternative',
+  'krautrock':         'psych-rock',
+  'drone':             'ambient',
+  'darkwave':          'goth',
+  'post-punk':         'punk',
+  'noise':             'alternative',
+  'shoegaze':          'indie',
+  'art-rock':          'alternative',
+  'dream-pop':         'indie',
+  'indie-pop':         'indie',
+  'synth-pop':         'electro',
+  'pop-rock':          'rock',
+  'singer-songwriter': 'singer-songwriter',
+  'new-wave':          'new-wave',
+  'soft-rock':         'soft-rock',
+  'americana':         'country',
+  'post-rock':         'rock',
+  'progressive-rock':  'prog-rock',
+};
+
+function resolveSpotifyGenre(g) { return SPOTIFY_GENRE_MAP[g] || g; }
+
+function getTasteQuadrant(emotionalAvg, accessibleAvg) {
+  const isEmotional  = emotionalAvg  < 0.5;
+  const isAccessible = accessibleAvg > 0.5;
+  if  (isEmotional  && isAccessible)  return 'emotional_accessible';
+  if  (isEmotional  && !isAccessible) return 'emotional_challenging';
+  if  (!isEmotional && isAccessible)  return 'intellectual_accessible';
+  return 'intellectual_challenging';
+}
 
 app.get('/spotify/cold-read-album', async (req, res) => {
   const { uid } = req.query;
   if (!uid) return res.status(400).json({ error: 'Missing uid' });
+
   try {
     const token = await getValidUserToken(uid);
 
     const diarySnap = await db.collection('users').doc(uid).collection('diaryEntries').get();
     const loggedIds = new Set(diarySnap.docs.map(d => d.data().albumId).filter(Boolean));
 
-    // Fetch top artists (all 3 ranges) + top tracks in parallel
-    const [shortArtists, mediumArtists, longArtists, longTracks] = await Promise.allSettled([
-      axios.get('https://api.spotify.com/v1/me/top/artists', { headers: { Authorization: `Bearer ${token}` }, params: { limit: 10, time_range: 'short_term'  } }),
-      axios.get('https://api.spotify.com/v1/me/top/artists', { headers: { Authorization: `Bearer ${token}` }, params: { limit: 10, time_range: 'medium_term' } }),
-      axios.get('https://api.spotify.com/v1/me/top/artists', { headers: { Authorization: `Bearer ${token}` }, params: { limit: 10, time_range: 'long_term'   } }),
-      axios.get('https://api.spotify.com/v1/me/top/tracks',  { headers: { Authorization: `Bearer ${token}` }, params: { limit: 10, time_range: 'long_term'   } })
-    ]);
+    const scoredEntries = diarySnap.docs
+      .map(d => d.data())
+      .filter(e => typeof e.emotionalScore === 'number' && typeof e.accessibleScore === 'number');
 
-    const artistIdSet = new Set();
-    for (const r of [shortArtists, mediumArtists, longArtists]) {
-      if (r.status === 'fulfilled') r.value.data.items.forEach(a => artistIdSet.add(a.id));
+    let candidates = [];
+
+    // ── Primary: taste map centroid → genre seeds ─────────────────────────────
+    if (scoredEntries.length >= 8) {
+      const emotionalAvg  = scoredEntries.reduce((s, e) => s + e.emotionalScore,  0) / scoredEntries.length;
+      const accessibleAvg = scoredEntries.reduce((s, e) => s + e.accessibleScore, 0) / scoredEntries.length;
+      const quadrant      = getTasteQuadrant(emotionalAvg, accessibleAvg);
+
+      // Adjacent quadrant for variety — cross the emotional/intellectual axis
+      const adjacentQuadrant = emotionalAvg < 0.5
+        ? (accessibleAvg > 0.5 ? 'intellectual_accessible' : 'intellectual_challenging')
+        : (accessibleAvg > 0.5 ? 'emotional_accessible'    : 'emotional_challenging');
+
+      const primaryPool  = GENRE_SEEDS_BY_QUADRANT[quadrant];
+      const adjacentPool = GENRE_SEEDS_BY_QUADRANT[adjacentQuadrant];
+
+      console.log(`🗺 Taste centroid: emotional=${emotionalAvg.toFixed(2)} accessible=${accessibleAvg.toFixed(2)} → ${quadrant}`);
+
+      const seedCombinations = [
+        // 3 primary + 2 adjacent
+        { seed_genres: [...new Set([...shuffle(primaryPool).slice(0,3), ...shuffle(adjacentPool).slice(0,2)].map(resolveSpotifyGenre))].slice(0,5).join(',') },
+        // 5 shuffled primary
+        { seed_genres: [...new Set(shuffle(primaryPool).slice(0,5).map(resolveSpotifyGenre))].join(',') },
+        // 5 shuffled adjacent
+        { seed_genres: [...new Set(shuffle(adjacentPool).slice(0,5).map(resolveSpotifyGenre))].join(',') },
+        // primary with valence target from position in quadrant
+        { seed_genres: [...new Set(shuffle(primaryPool).slice(0,5).map(resolveSpotifyGenre))].join(','), target_valence: accessibleAvg.toFixed(2) }
+      ];
+
+      const recResults = await Promise.allSettled(
+        seedCombinations.map(params =>
+          axios.get('https://api.spotify.com/v1/recommendations', {
+            headers: { Authorization: `Bearer ${token}` },
+            params:  { ...params, limit: 20 }
+          })
+        )
+      );
+
+      const seenIds = new Set();
+      for (const result of recResults) {
+        if (result.status !== 'fulfilled') continue;
+        for (const track of result.value.data.tracks) {
+          const album = track.album;
+          if (!seenIds.has(album.id) && !loggedIds.has(album.id)) {
+            seenIds.add(album.id);
+            candidates.push({ albumId: album.id, albumTitle: album.name, albumArtist: album.artists[0]?.name ?? '', albumCoverURL: album.images[0]?.url ?? '', artistId: album.artists[0]?.id ?? '' });
+          }
+        }
+      }
+
+      console.log(`✅ Genre seeds produced ${candidates.length} candidates`);
     }
 
-    const trackIdSet = new Set();
-    if (longTracks.status === 'fulfilled') longTracks.value.data.items.forEach(t => trackIdSet.add(t.id));
+    // ── Fallback: top artists across all time ranges ───────────────────────────
+    if (candidates.length === 0) {
+      console.log(`⚠️ Falling back to top-artist seeds for uid ${uid}`);
 
-    const allArtistIds = [...artistIdSet];
-    const allTrackIds  = [...trackIdSet];
+      const [shortArtists, mediumArtists, longArtists, longTracks] = await Promise.allSettled([
+        axios.get('https://api.spotify.com/v1/me/top/artists', { headers: { Authorization: `Bearer ${token}` }, params: { limit: 10, time_range: 'short_term'  } }),
+        axios.get('https://api.spotify.com/v1/me/top/artists', { headers: { Authorization: `Bearer ${token}` }, params: { limit: 10, time_range: 'medium_term' } }),
+        axios.get('https://api.spotify.com/v1/me/top/artists', { headers: { Authorization: `Bearer ${token}` }, params: { limit: 10, time_range: 'long_term'   } }),
+        axios.get('https://api.spotify.com/v1/me/top/tracks',  { headers: { Authorization: `Bearer ${token}` }, params: { limit: 10, time_range: 'long_term'   } })
+      ]);
 
-    if (!allArtistIds.length && !allTrackIds.length)
-      return res.status(404).json({ error: 'No listening history found on your Spotify account.' });
+      const artistIdSet = new Set();
+      for (const r of [shortArtists, mediumArtists, longArtists]) {
+        if (r.status === 'fulfilled') r.value.data.items.forEach(a => artistIdSet.add(a.id));
+      }
+      const trackIdSet = new Set();
+      if (longTracks.status === 'fulfilled') longTracks.value.data.items.forEach(t => trackIdSet.add(t.id));
 
-    // Build up to 4 seed combinations — Spotify caps at 5 seeds per call
-    const seedCombinations = [];
+      const allArtistIds = [...artistIdSet];
+      const allTrackIds  = [...trackIdSet];
 
-    if (allArtistIds.length >= 3 && allTrackIds.length >= 2)
-      seedCombinations.push({ seed_artists: shuffle(allArtistIds).slice(0, 3).join(','), seed_tracks: shuffle(allTrackIds).slice(0, 2).join(',') });
+      if (!allArtistIds.length && !allTrackIds.length)
+        return res.status(404).json({ error: 'No listening history found on your Spotify account.' });
 
-    if (allArtistIds.length >= 5)
-      seedCombinations.push({ seed_artists: shuffle(allArtistIds).slice(0, 5).join(',') });
+      const seedCombinations = [];
+      if (allArtistIds.length >= 3 && allTrackIds.length >= 2)
+        seedCombinations.push({ seed_artists: shuffle(allArtistIds).slice(0,3).join(','), seed_tracks: shuffle(allTrackIds).slice(0,2).join(',') });
+      if (allArtistIds.length >= 5)
+        seedCombinations.push({ seed_artists: shuffle(allArtistIds).slice(0,5).join(',') });
+      if (allTrackIds.length >= 5)
+        seedCombinations.push({ seed_tracks: shuffle(allTrackIds).slice(0,5).join(',') });
+      if (longArtists.status === 'fulfilled' && longArtists.value.data.items.length >= 5)
+        seedCombinations.push({ seed_artists: longArtists.value.data.items.slice(0,5).map(a => a.id).join(',') });
+      if (!seedCombinations.length) {
+        const params = {};
+        if (allArtistIds.length) params.seed_artists = allArtistIds.slice(0,3).join(',');
+        if (allTrackIds.length)  params.seed_tracks  = allTrackIds.slice(0,2).join(',');
+        seedCombinations.push(params);
+      }
 
-    if (allTrackIds.length >= 5)
-      seedCombinations.push({ seed_tracks: shuffle(allTrackIds).slice(0, 5).join(',') });
+      const recResults = await Promise.allSettled(
+        seedCombinations.map(params =>
+          axios.get('https://api.spotify.com/v1/recommendations', {
+            headers: { Authorization: `Bearer ${token}` },
+            params:  { ...params, limit: 20 }
+          })
+        )
+      );
 
-    if (longArtists.status === 'fulfilled' && longArtists.value.data.items.length >= 5)
-      seedCombinations.push({ seed_artists: longArtists.value.data.items.slice(0, 5).map(a => a.id).join(',') });
-
-    // Fallback: use whatever seeds exist
-    if (!seedCombinations.length) {
-      const params = {};
-      if (allArtistIds.length) params.seed_artists = allArtistIds.slice(0, 3).join(',');
-      if (allTrackIds.length)  params.seed_tracks  = allTrackIds.slice(0, 2).join(',');
-      seedCombinations.push(params);
-    }
-
-    // Fire all combinations in parallel
-    const recResults = await Promise.allSettled(
-      seedCombinations.map(params =>
-        axios.get('https://api.spotify.com/v1/recommendations', {
-          headers: { Authorization: `Bearer ${token}` },
-          params:  { ...params, limit: 20 }
-        })
-      )
-    );
-
-    const seenAlbumIds = new Set();
-    const candidates   = [];
-
-    for (const result of recResults) {
-      if (result.status !== 'fulfilled') continue;
-      for (const track of result.value.data.tracks) {
-        const album = track.album;
-        if (!seenAlbumIds.has(album.id) && !loggedIds.has(album.id)) {
-          seenAlbumIds.add(album.id);
-          candidates.push({ albumId: album.id, albumTitle: album.name, albumArtist: album.artists[0]?.name ?? '', albumCoverURL: album.images[0]?.url ?? '', artistId: album.artists[0]?.id ?? '' });
+      const seenIds = new Set();
+      for (const result of recResults) {
+        if (result.status !== 'fulfilled') continue;
+        for (const track of result.value.data.tracks) {
+          const album = track.album;
+          if (!seenIds.has(album.id) && !loggedIds.has(album.id)) {
+            seenIds.add(album.id);
+            candidates.push({ albumId: album.id, albumTitle: album.name, albumArtist: album.artists[0]?.name ?? '', albumCoverURL: album.images[0]?.url ?? '', artistId: album.artists[0]?.id ?? '' });
+          }
         }
       }
     }
 
-    if (!candidates.length)
-      return res.status(404).json({ error: "You've already logged everything Spotify recommended. Try again in a few days." });
+    if (candidates.length === 0)
+      return res.status(404).json({ error: "Couldn't find anything new to suggest right now. Try again in a little while." });
 
     const pick = candidates[Math.floor(Math.random() * candidates.length)];
     console.log(`✅ Cold read: "${pick.albumTitle}" by ${pick.albumArtist} (${candidates.length} candidates)`);
