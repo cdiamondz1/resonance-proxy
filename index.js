@@ -388,45 +388,20 @@ app.post('/spotify/sync-prompts', async (req, res) => {
   } catch (err) { console.error('❌ Sync prompts failed:', err.response?.data || err.message); res.status(500).json({ error: err.message }); }
 });
 
-// ── Cold Read — Taste Map Centroid Album ──────────────────────────────────────
-// Primary (≥8 scored entries): computes taste centroid, maps to validated
-// Spotify genre seeds by quadrant, runs 4 combinations in parallel.
-// Fallback (<8 entries): top artists across all time ranges.
+// ── Cold Read — Artist Deep Cuts ──────────────────────────────────────────────
+// Finds unlogged albums by artists the user already loves.
 //
-// All genre strings below are from Spotify's official available-genre-seeds
-// endpoint and are guaranteed to be accepted by the recommendations API.
-
-const GENRE_SEEDS_BY_QUADRANT = {
-  // High emotional, high accessible — pop/soul/dance territory
-  emotional_accessible: [
-    'pop', 'soul', 'r-n-b', 'dance', 'funk',
-    'disco', 'reggaeton', 'hip-hop', 'groove', 'pop-film'
-  ],
-  // High emotional, low accessible — punk/metal/intense territory
-  emotional_challenging: [
-    'punk', 'metal', 'hard-rock', 'grunge', 'emo',
-    'psych-rock', 'goth', 'industrial', 'alternative', 'rock'
-  ],
-  // Low emotional, high accessible — indie/folk/singer-songwriter territory
-  intellectual_accessible: [
-    'indie', 'folk', 'singer-songwriter', 'acoustic', 'new-wave',
-    'soft-rock', 'country', 'bluegrass', 'bossanova', 'latin'
-  ],
-  // Low emotional, low accessible — jazz/classical/ambient territory
-  intellectual_challenging: [
-    'jazz', 'classical', 'ambient', 'prog-rock', 'post-rock',
-    'blues', 'world-music', 'opera', 'trance', 'study'
-  ]
-};
-
-function getTasteQuadrant(emotionalAvg, accessibleAvg) {
-  const isEmotional  = emotionalAvg  < 0.5;
-  const isAccessible = accessibleAvg > 0.5;
-  if  (isEmotional  && isAccessible)  return 'emotional_accessible';
-  if  (isEmotional  && !isAccessible) return 'emotional_challenging';
-  if  (!isEmotional && isAccessible)  return 'intellectual_accessible';
-  return 'intellectual_challenging';
-}
+// Primary path:
+//   1. Fetch top artists across all three time ranges (up to 30 unique artists)
+//   2. For each artist fetch their full discography in parallel
+//   3. Filter out already-logged albums
+//   4. Pick one at random — this is a blind spot in their own taste map
+//
+// Fallback (if all top-artist albums are logged):
+//   1. Take a random sample of top artists
+//   2. Fetch their related artists
+//   3. Pull discographies from those related artists
+//   4. Filter and pick — one degree of separation from their taste
 
 app.get('/spotify/cold-read-album', async (req, res) => {
   const { uid } = req.query;
@@ -435,140 +410,129 @@ app.get('/spotify/cold-read-album', async (req, res) => {
   try {
     const token = await getValidUserToken(uid);
 
+    // Load logged album IDs
     const diarySnap = await db.collection('users').doc(uid).collection('diaryEntries').get();
     const loggedIds = new Set(diarySnap.docs.map(d => d.data().albumId).filter(Boolean));
 
-    const scoredEntries = diarySnap.docs
-      .map(d => d.data())
-      .filter(e => typeof e.emotionalScore === 'number' && typeof e.accessibleScore === 'number');
+    // ── Step 1: Collect top artists across all three time ranges ──────────────
+    const [shortRes, mediumRes, longRes] = await Promise.allSettled([
+      axios.get('https://api.spotify.com/v1/me/top/artists', { headers: { Authorization: `Bearer ${token}` }, params: { limit: 10, time_range: 'short_term'  } }),
+      axios.get('https://api.spotify.com/v1/me/top/artists', { headers: { Authorization: `Bearer ${token}` }, params: { limit: 10, time_range: 'medium_term' } }),
+      axios.get('https://api.spotify.com/v1/me/top/artists', { headers: { Authorization: `Bearer ${token}` }, params: { limit: 10, time_range: 'long_term'   } })
+    ]);
 
+    const artistMap = new Map(); // id → name, deduped
+    for (const r of [shortRes, mediumRes, longRes]) {
+      if (r.status === 'fulfilled') {
+        for (const a of r.value.data.items) {
+          if (!artistMap.has(a.id)) artistMap.set(a.id, a.name);
+        }
+      }
+    }
+
+    const topArtistIds = [...artistMap.keys()];
+
+    if (!topArtistIds.length) {
+      return res.status(404).json({ error: 'No listening history found on your Spotify account.' });
+    }
+
+    console.log(`🎵 Found ${topArtistIds.length} unique top artists`);
+
+    // ── Step 2: Fetch discographies for all top artists in parallel ───────────
+    const discographyResults = await Promise.allSettled(
+      topArtistIds.map(id =>
+        axios.get(`https://api.spotify.com/v1/artists/${id}/albums`, {
+          headers: { Authorization: `Bearer ${token}` },
+          params:  { include_groups: 'album', limit: 50, market: 'US' }
+        }).then(r => ({ artistId: id, artistName: artistMap.get(id), albums: r.data.items }))
+      )
+    );
+
+    // ── Step 3: Build candidate pool — unlogged albums only ──────────────────
+    const seenAlbumIds = new Set();
     let candidates = [];
 
-    // ── Primary: taste map centroid → genre seeds ─────────────────────────────
-    if (scoredEntries.length >= 8) {
-      const emotionalAvg  = scoredEntries.reduce((s, e) => s + e.emotionalScore,  0) / scoredEntries.length;
-      const accessibleAvg = scoredEntries.reduce((s, e) => s + e.accessibleScore, 0) / scoredEntries.length;
-      const quadrant      = getTasteQuadrant(emotionalAvg, accessibleAvg);
-
-      // Adjacent quadrant — cross the emotional/intellectual axis for variety
-      const adjacentQuadrant = emotionalAvg < 0.5
-        ? (accessibleAvg > 0.5 ? 'intellectual_accessible' : 'intellectual_challenging')
-        : (accessibleAvg > 0.5 ? 'emotional_accessible'    : 'emotional_challenging');
-
-      const primaryPool  = GENRE_SEEDS_BY_QUADRANT[quadrant];
-      const adjacentPool = GENRE_SEEDS_BY_QUADRANT[adjacentQuadrant];
-
-      console.log(`🗺 Taste centroid: emotional=${emotionalAvg.toFixed(2)} accessible=${accessibleAvg.toFixed(2)} → ${quadrant} (adjacent: ${adjacentQuadrant})`);
-
-      // 4 combinations — Spotify caps at 5 seeds per call
-      const seedCombinations = [
-        // 3 primary + 2 adjacent
-        { seed_genres: [...new Set([...shuffle(primaryPool).slice(0,3), ...shuffle(adjacentPool).slice(0,2)])].slice(0,5).join(',') },
-        // 5 shuffled primary
-        { seed_genres: shuffle(primaryPool).slice(0,5).join(',') },
-        // 5 shuffled adjacent
-        { seed_genres: shuffle(adjacentPool).slice(0,5).join(',') },
-        // primary with valence target tuned to accessible score
-        { seed_genres: shuffle(primaryPool).slice(0,5).join(','), target_valence: accessibleAvg.toFixed(2) }
-      ];
-
-      console.log(`🎲 Genre seed combinations:`, seedCombinations.map(c => c.seed_genres));
-
-      const recResults = await Promise.allSettled(
-        seedCombinations.map(params =>
-          axios.get('https://api.spotify.com/v1/recommendations', {
-            headers: { Authorization: `Bearer ${token}` },
-            params:  { ...params, limit: 20 }
-          })
-        )
-      );
-
-      // Log any failures so we can diagnose
-      recResults.forEach((r, i) => {
-        if (r.status === 'rejected') {
-          console.error(`❌ Recommendation combination ${i} failed:`, r.reason?.response?.data || r.reason?.message);
-        }
-      });
-
-      const seenIds = new Set();
-      for (const result of recResults) {
-        if (result.status !== 'fulfilled') continue;
-        for (const track of result.value.data.tracks) {
-          const album = track.album;
-          if (!seenIds.has(album.id) && !loggedIds.has(album.id)) {
-            seenIds.add(album.id);
-            candidates.push({ albumId: album.id, albumTitle: album.name, albumArtist: album.artists[0]?.name ?? '', albumCoverURL: album.images[0]?.url ?? '', artistId: album.artists[0]?.id ?? '' });
-          }
+    for (const result of discographyResults) {
+      if (result.status !== 'fulfilled') continue;
+      const { artistName, albums } = result.value;
+      for (const album of albums) {
+        if (!seenAlbumIds.has(album.id) && !loggedIds.has(album.id)) {
+          seenAlbumIds.add(album.id);
+          candidates.push({
+            albumId:       album.id,
+            albumTitle:    album.name,
+            albumArtist:   album.artists[0]?.name ?? artistName,
+            albumCoverURL: album.images[0]?.url   ?? '',
+            artistId:      album.artists[0]?.id   ?? ''
+          });
         }
       }
-
-      console.log(`✅ Genre seeds produced ${candidates.length} candidates`);
     }
 
-    // ── Fallback: top artists across all time ranges ───────────────────────────
+    console.log(`🎯 Primary pool: ${candidates.length} unlogged albums from ${topArtistIds.length} top artists`);
+
+    // ── Fallback: related artists one degree out ──────────────────────────────
     if (candidates.length === 0) {
-      console.log(`⚠️ Falling back to top-artist seeds for uid ${uid}`);
+      console.log('⚠️ All top-artist albums logged — expanding to related artists');
 
-      const [shortArtists, mediumArtists, longArtists, longTracks] = await Promise.allSettled([
-        axios.get('https://api.spotify.com/v1/me/top/artists', { headers: { Authorization: `Bearer ${token}` }, params: { limit: 10, time_range: 'short_term'  } }),
-        axios.get('https://api.spotify.com/v1/me/top/artists', { headers: { Authorization: `Bearer ${token}` }, params: { limit: 10, time_range: 'medium_term' } }),
-        axios.get('https://api.spotify.com/v1/me/top/artists', { headers: { Authorization: `Bearer ${token}` }, params: { limit: 10, time_range: 'long_term'   } }),
-        axios.get('https://api.spotify.com/v1/me/top/tracks',  { headers: { Authorization: `Bearer ${token}` }, params: { limit: 10, time_range: 'long_term'   } })
-      ]);
+      // Sample 5 random top artists to seed related artist lookup
+      const seedArtists = shuffle(topArtistIds).slice(0, 5);
 
-      const artistIdSet = new Set();
-      for (const r of [shortArtists, mediumArtists, longArtists]) {
-        if (r.status === 'fulfilled') r.value.data.items.forEach(a => artistIdSet.add(a.id));
-      }
-      const trackIdSet = new Set();
-      if (longTracks.status === 'fulfilled') longTracks.value.data.items.forEach(t => trackIdSet.add(t.id));
-
-      const allArtistIds = [...artistIdSet];
-      const allTrackIds  = [...trackIdSet];
-
-      if (!allArtistIds.length && !allTrackIds.length)
-        return res.status(404).json({ error: 'No listening history found on your Spotify account.' });
-
-      const seedCombinations = [];
-      if (allArtistIds.length >= 3 && allTrackIds.length >= 2)
-        seedCombinations.push({ seed_artists: shuffle(allArtistIds).slice(0,3).join(','), seed_tracks: shuffle(allTrackIds).slice(0,2).join(',') });
-      if (allArtistIds.length >= 5)
-        seedCombinations.push({ seed_artists: shuffle(allArtistIds).slice(0,5).join(',') });
-      if (allTrackIds.length >= 5)
-        seedCombinations.push({ seed_tracks: shuffle(allTrackIds).slice(0,5).join(',') });
-      if (longArtists.status === 'fulfilled' && longArtists.value.data.items.length >= 5)
-        seedCombinations.push({ seed_artists: longArtists.value.data.items.slice(0,5).map(a => a.id).join(',') });
-      if (!seedCombinations.length) {
-        const params = {};
-        if (allArtistIds.length) params.seed_artists = allArtistIds.slice(0,3).join(',');
-        if (allTrackIds.length)  params.seed_tracks  = allTrackIds.slice(0,2).join(',');
-        seedCombinations.push(params);
-      }
-
-      const recResults = await Promise.allSettled(
-        seedCombinations.map(params =>
-          axios.get('https://api.spotify.com/v1/recommendations', {
-            headers: { Authorization: `Bearer ${token}` },
-            params:  { ...params, limit: 20 }
-          })
+      const relatedResults = await Promise.allSettled(
+        seedArtists.map(id =>
+          axios.get(`https://api.spotify.com/v1/artists/${id}/related-artists`, {
+            headers: { Authorization: `Bearer ${token}` }
+          }).then(r => r.data.artists.slice(0, 5)) // top 5 related per seed
         )
       );
 
-      const seenIds = new Set();
-      for (const result of recResults) {
-        if (result.status !== 'fulfilled') continue;
-        for (const track of result.value.data.tracks) {
-          const album = track.album;
-          if (!seenIds.has(album.id) && !loggedIds.has(album.id)) {
-            seenIds.add(album.id);
-            candidates.push({ albumId: album.id, albumTitle: album.name, albumArtist: album.artists[0]?.name ?? '', albumCoverURL: album.images[0]?.url ?? '', artistId: album.artists[0]?.id ?? '' });
+      const relatedArtistMap = new Map();
+      for (const r of relatedResults) {
+        if (r.status !== 'fulfilled') continue;
+        for (const a of r.value) {
+          if (!artistMap.has(a.id)) { // skip artists they already follow
+            relatedArtistMap.set(a.id, a.name);
           }
         }
       }
+
+      const relatedArtistIds = [...relatedArtistMap.keys()];
+      console.log(`🔗 Found ${relatedArtistIds.length} related artists`);
+
+      const relatedDiscResults = await Promise.allSettled(
+        relatedArtistIds.map(id =>
+          axios.get(`https://api.spotify.com/v1/artists/${id}/albums`, {
+            headers: { Authorization: `Bearer ${token}` },
+            params:  { include_groups: 'album', limit: 20, market: 'US' }
+          }).then(r => ({ artistId: id, artistName: relatedArtistMap.get(id), albums: r.data.items }))
+        )
+      );
+
+      for (const result of relatedDiscResults) {
+        if (result.status !== 'fulfilled') continue;
+        const { artistName, albums } = result.value;
+        for (const album of albums) {
+          if (!seenAlbumIds.has(album.id) && !loggedIds.has(album.id)) {
+            seenAlbumIds.add(album.id);
+            candidates.push({
+              albumId:       album.id,
+              albumTitle:    album.name,
+              albumArtist:   album.artists[0]?.name ?? artistName,
+              albumCoverURL: album.images[0]?.url   ?? '',
+              artistId:      album.artists[0]?.id   ?? ''
+            });
+          }
+        }
+      }
+
+      console.log(`🎯 Fallback pool: ${candidates.length} unlogged albums from related artists`);
     }
 
-    if (candidates.length === 0)
-      return res.status(404).json({ error: "Couldn't find anything new to suggest right now. Try again in a little while." });
+    if (candidates.length === 0) {
+      return res.status(404).json({
+        error: "You've logged everything by your top artists and their related artists. Impressive."
+      });
+    }
 
     const pick = candidates[Math.floor(Math.random() * candidates.length)];
     console.log(`✅ Cold read: "${pick.albumTitle}" by ${pick.albumArtist} (${candidates.length} candidates)`);
