@@ -94,7 +94,10 @@ async function getValidUserToken(uid) {
 
   const newAccessToken = response.data.access_token;
   const newExpiresAt   = admin.firestore.Timestamp.fromMillis(now + response.data.expires_in * 1000);
-  await db.collection('users').doc(uid).update({ 'spotifyTokens.accessToken': newAccessToken, 'spotifyTokens.expiresAt': newExpiresAt });
+  await db.collection('users').doc(uid).update({
+    'spotifyTokens.accessToken': newAccessToken,
+    'spotifyTokens.expiresAt':   newExpiresAt
+  });
   console.log(`✅ Refreshed Spotify user token for ${uid}`);
   return newAccessToken;
 }
@@ -128,14 +131,14 @@ async function sendPushNotification(recipientUid, type, payload) {
 function buildMessage(type, payload, token) {
   const base = { token, apns: apnsBase };
   switch (type) {
-    case 'newFollower':       return { ...base, notification: { title: `${payload.fromName} followed you`, body: 'Tap to view their profile.' }, data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '' } };
-    case 'entryComment':      return { ...base, notification: { title: `${payload.fromName} left a note`, body: payload.albumTitle ? `on your entry for ${payload.albumTitle}` : 'on your entry' }, data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '', entryId: payload.entryId ?? '' } };
-    case 'commentReply':      return { ...base, notification: { title: `${payload.fromName} replied to you`, body: payload.albumTitle ? `on ${payload.albumTitle}` : 'on your note' }, data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '', entryId: payload.entryId ?? '' } };
-    case 'commentLike':       return { ...base, notification: { title: `${payload.fromName} liked your note`, body: payload.albumTitle ? `on ${payload.albumTitle}` : '' }, data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '', entryId: payload.entryId ?? '' } };
-    case 'albumSuggestion':   return { ...base, notification: { title: `${payload.fromName} suggested an album`, body: payload.albumTitle ? `"${payload.albumTitle}" — check it out on their profile` : 'Tap to see what they think you should hear.' }, data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '' } };
-    case 'suggestionAgree':   return { ...base, notification: { title: `${payload.fromName} agrees`, body: payload.albumTitle ? `You should really listen to ${payload.albumTitle}` : 'Someone else thinks you should hear this too.' }, data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '' } };
-    case 'suggestionReviewed':return { ...base, notification: { title: `${payload.authorName} finally listened`, body: payload.albumTitle ? `${payload.albumTitle}${payload.ratingString ? ` — ${payload.ratingString}` : ''}` : 'Tap to see their entry.' }, data: { type, authorUid: payload.authorUid ?? '', authorName: payload.authorName ?? '', entryId: payload.entryId ?? '' } };
-    case 'weeklyPrompt':      return { ...base, notification: { title: "This week's prompt is here", body: payload.promptText ? `"${payload.promptText}"` : 'Open Resonance to see it.' }, data: { type, promptText: payload.promptText ?? '' } };
+    case 'newFollower':        return { ...base, notification: { title: `${payload.fromName} followed you`, body: 'Tap to view their profile.' }, data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '' } };
+    case 'entryComment':       return { ...base, notification: { title: `${payload.fromName} left a note`, body: payload.albumTitle ? `on your entry for ${payload.albumTitle}` : 'on your entry' }, data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '', entryId: payload.entryId ?? '' } };
+    case 'commentReply':       return { ...base, notification: { title: `${payload.fromName} replied to you`, body: payload.albumTitle ? `on ${payload.albumTitle}` : 'on your note' }, data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '', entryId: payload.entryId ?? '' } };
+    case 'commentLike':        return { ...base, notification: { title: `${payload.fromName} liked your note`, body: payload.albumTitle ? `on ${payload.albumTitle}` : '' }, data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '', entryId: payload.entryId ?? '' } };
+    case 'albumSuggestion':    return { ...base, notification: { title: `${payload.fromName} suggested an album`, body: payload.albumTitle ? `"${payload.albumTitle}" — check it out on their profile` : 'Tap to see what they think you should hear.' }, data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '' } };
+    case 'suggestionAgree':    return { ...base, notification: { title: `${payload.fromName} agrees`, body: payload.albumTitle ? `You should really listen to ${payload.albumTitle}` : 'Someone else thinks you should hear this too.' }, data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '' } };
+    case 'suggestionReviewed': return { ...base, notification: { title: `${payload.authorName} finally listened`, body: payload.albumTitle ? `${payload.albumTitle}${payload.ratingString ? ` — ${payload.ratingString}` : ''}` : 'Tap to see their entry.' }, data: { type, authorUid: payload.authorUid ?? '', authorName: payload.authorName ?? '', entryId: payload.entryId ?? '' } };
+    case 'weeklyPrompt':       return { ...base, notification: { title: "This week's prompt is here", body: payload.promptText ? `"${payload.promptText}"` : 'Open Resonance to see it.' }, data: { type, promptText: payload.promptText ?? '' } };
     default: return null;
   }
 }
@@ -147,8 +150,6 @@ function getWeekNumber(date) {
   const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
   return Math.ceil((((d - yearStart) / 86_400_000) + 1) / 7);
 }
-
-// ── Auth middleware ───────────────────────────────────────────────────────────
 
 function requireNotifySecret(req, res, next) {
   const secret = req.headers['x-notify-secret'];
@@ -276,7 +277,7 @@ app.get('/spotify/auth/callback', async (req, res) => {
     const expiresAt = admin.firestore.Timestamp.fromMillis(Date.now() + expires_in * 1000);
     await db.collection('users').doc(uid).update({ spotifyTokens: { accessToken, refreshToken, expiresAt }, spotifyConnected: true });
     console.log(`✅ Spotify connected for user ${uid}`);
-    res.send(`<html><body style="font-family: sans-serif; text-align: center; padding: 60px; background: #080e1a; color: #f7cc3a;"><h2>Spotify connected ✓</h2><p style="color: white;">You can close this window and return to Resonance.</p></body></html>`);
+    res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#080e1a;color:#f7cc3a;"><h2>Spotify connected ✓</h2><p style="color:white;">You can close this window and return to Resonance.</p></body></html>`);
   } catch (err) { console.error('❌ Token exchange failed:', err.response?.data || err.message); res.status(500).send('Failed to connect Spotify. Please try again.'); }
 });
 
@@ -364,8 +365,8 @@ app.post('/spotify/sync-prompts', async (req, res) => {
     ]);
     const loggedAlbumIds = new Set(diarySnap.docs.map(d => d.data().albumId));
     const dismissed      = new Set(userDoc.data()?.dismissedSpotifyPrompts ?? []);
-    const seenAlbumIds = new Set();
-    const candidates   = [];
+    const seenAlbumIds   = new Set();
+    const candidates     = [];
     for (const item of result.data.items) {
       const album = item.track.album;
       if (!seenAlbumIds.has(album.id) && !loggedAlbumIds.has(album.id) && !dismissed.has(album.id)) {
@@ -388,55 +389,35 @@ app.post('/spotify/sync-prompts', async (req, res) => {
 });
 
 // ── Cold Read — Taste Map Centroid Album ──────────────────────────────────────
-// Primary path (≥8 scored entries): computes taste map centroid from diary
-// entries, maps to Spotify genre seeds by quadrant, runs 4 recommendation
-// combinations in parallel.
-// Fallback (<8 scored entries): seeds from top artists across all time ranges.
+// Primary (≥8 scored entries): computes taste centroid, maps to validated
+// Spotify genre seeds by quadrant, runs 4 combinations in parallel.
+// Fallback (<8 entries): top artists across all time ranges.
+//
+// All genre strings below are from Spotify's official available-genre-seeds
+// endpoint and are guaranteed to be accepted by the recommendations API.
 
 const GENRE_SEEDS_BY_QUADRANT = {
+  // High emotional, high accessible — pop/soul/dance territory
   emotional_accessible: [
     'pop', 'soul', 'r-n-b', 'dance', 'funk',
-    'indie-pop', 'synth-pop', 'pop-rock', 'disco', 'reggaeton'
+    'disco', 'reggaeton', 'hip-hop', 'groove', 'pop-film'
   ],
+  // High emotional, low accessible — punk/metal/intense territory
   emotional_challenging: [
-    'experimental', 'post-punk', 'noise', 'shoegaze', 'art-rock',
-    'avant-garde', 'psychedelic', 'industrial', 'darkwave', 'emo'
+    'punk', 'metal', 'hard-rock', 'grunge', 'emo',
+    'psych-rock', 'goth', 'industrial', 'alternative', 'rock'
   ],
+  // Low emotional, high accessible — indie/folk/singer-songwriter territory
   intellectual_accessible: [
-    'alternative', 'indie', 'folk', 'singer-songwriter', 'acoustic',
-    'chamber-pop', 'dream-pop', 'new-wave', 'soft-rock', 'americana'
+    'indie', 'folk', 'singer-songwriter', 'acoustic', 'new-wave',
+    'soft-rock', 'country', 'bluegrass', 'bossanova', 'latin'
   ],
+  // Low emotional, low accessible — jazz/classical/ambient territory
   intellectual_challenging: [
-    'jazz', 'classical', 'progressive-rock', 'post-rock', 'ambient',
-    'avant-garde-jazz', 'math-rock', 'krautrock', 'drone', 'black-metal'
+    'jazz', 'classical', 'ambient', 'prog-rock', 'post-rock',
+    'blues', 'world-music', 'opera', 'trance', 'study'
   ]
 };
-
-const SPOTIFY_GENRE_MAP = {
-  'avant-garde':       'ambient',
-  'avant-garde-jazz':  'jazz',
-  'chamber-pop':       'indie',
-  'math-rock':         'alternative',
-  'krautrock':         'psych-rock',
-  'drone':             'ambient',
-  'darkwave':          'goth',
-  'post-punk':         'punk',
-  'noise':             'alternative',
-  'shoegaze':          'indie',
-  'art-rock':          'alternative',
-  'dream-pop':         'indie',
-  'indie-pop':         'indie',
-  'synth-pop':         'electro',
-  'pop-rock':          'rock',
-  'singer-songwriter': 'singer-songwriter',
-  'new-wave':          'new-wave',
-  'soft-rock':         'soft-rock',
-  'americana':         'country',
-  'post-rock':         'rock',
-  'progressive-rock':  'prog-rock',
-};
-
-function resolveSpotifyGenre(g) { return SPOTIFY_GENRE_MAP[g] || g; }
 
 function getTasteQuadrant(emotionalAvg, accessibleAvg) {
   const isEmotional  = emotionalAvg  < 0.5;
@@ -469,7 +450,7 @@ app.get('/spotify/cold-read-album', async (req, res) => {
       const accessibleAvg = scoredEntries.reduce((s, e) => s + e.accessibleScore, 0) / scoredEntries.length;
       const quadrant      = getTasteQuadrant(emotionalAvg, accessibleAvg);
 
-      // Adjacent quadrant for variety — cross the emotional/intellectual axis
+      // Adjacent quadrant — cross the emotional/intellectual axis for variety
       const adjacentQuadrant = emotionalAvg < 0.5
         ? (accessibleAvg > 0.5 ? 'intellectual_accessible' : 'intellectual_challenging')
         : (accessibleAvg > 0.5 ? 'emotional_accessible'    : 'emotional_challenging');
@@ -477,18 +458,21 @@ app.get('/spotify/cold-read-album', async (req, res) => {
       const primaryPool  = GENRE_SEEDS_BY_QUADRANT[quadrant];
       const adjacentPool = GENRE_SEEDS_BY_QUADRANT[adjacentQuadrant];
 
-      console.log(`🗺 Taste centroid: emotional=${emotionalAvg.toFixed(2)} accessible=${accessibleAvg.toFixed(2)} → ${quadrant}`);
+      console.log(`🗺 Taste centroid: emotional=${emotionalAvg.toFixed(2)} accessible=${accessibleAvg.toFixed(2)} → ${quadrant} (adjacent: ${adjacentQuadrant})`);
 
+      // 4 combinations — Spotify caps at 5 seeds per call
       const seedCombinations = [
         // 3 primary + 2 adjacent
-        { seed_genres: [...new Set([...shuffle(primaryPool).slice(0,3), ...shuffle(adjacentPool).slice(0,2)].map(resolveSpotifyGenre))].slice(0,5).join(',') },
+        { seed_genres: [...new Set([...shuffle(primaryPool).slice(0,3), ...shuffle(adjacentPool).slice(0,2)])].slice(0,5).join(',') },
         // 5 shuffled primary
-        { seed_genres: [...new Set(shuffle(primaryPool).slice(0,5).map(resolveSpotifyGenre))].join(',') },
+        { seed_genres: shuffle(primaryPool).slice(0,5).join(',') },
         // 5 shuffled adjacent
-        { seed_genres: [...new Set(shuffle(adjacentPool).slice(0,5).map(resolveSpotifyGenre))].join(',') },
-        // primary with valence target from position in quadrant
-        { seed_genres: [...new Set(shuffle(primaryPool).slice(0,5).map(resolveSpotifyGenre))].join(','), target_valence: accessibleAvg.toFixed(2) }
+        { seed_genres: shuffle(adjacentPool).slice(0,5).join(',') },
+        // primary with valence target tuned to accessible score
+        { seed_genres: shuffle(primaryPool).slice(0,5).join(','), target_valence: accessibleAvg.toFixed(2) }
       ];
+
+      console.log(`🎲 Genre seed combinations:`, seedCombinations.map(c => c.seed_genres));
 
       const recResults = await Promise.allSettled(
         seedCombinations.map(params =>
@@ -498,6 +482,13 @@ app.get('/spotify/cold-read-album', async (req, res) => {
           })
         )
       );
+
+      // Log any failures so we can diagnose
+      recResults.forEach((r, i) => {
+        if (r.status === 'rejected') {
+          console.error(`❌ Recommendation combination ${i} failed:`, r.reason?.response?.data || r.reason?.message);
+        }
+      });
 
       const seenIds = new Set();
       for (const result of recResults) {
