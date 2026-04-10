@@ -11,10 +11,6 @@ app.use(cors());
 app.use(express.json());
 
 // ── Firebase Admin ────────────────────────────────────────────────────────────
-// The private_key field in the service account JSON uses \n escape sequences
-// for newlines. When the JSON is stored as a single-line string in an env var
-// and parsed back, those sequences must be converted to real newline characters
-// otherwise the RSA key is malformed and every Admin SDK call returns a 401.
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
@@ -54,8 +50,6 @@ refreshToken();
 setInterval(refreshToken, 50 * 60 * 1000);
 
 // ── Keep-alive ────────────────────────────────────────────────────────────────
-// Render free tier spins down after 10 minutes of inactivity.
-// Ping every 9 minutes to stay just inside that window.
 
 setInterval(() => {
   const https = require('https');
@@ -143,7 +137,6 @@ async function sendPushNotification(recipientUid, type, payload) {
     console.log(`✅ Push sent [${type}] to ${recipientUid}: ${result}`);
     return { sent: true };
   } catch (err) {
-    // Purge stale tokens so we stop attempting delivery to dead registrations.
     const staleCodes = [
       'messaging/registration-token-not-registered',
       'messaging/invalid-registration-token'
@@ -286,10 +279,6 @@ app.get('/test-token', async (req, res) => {
 });
 
 // ── Debug: FCM send ───────────────────────────────────────────────────────────
-// Temporary diagnostic endpoint — remove before App Store submission.
-// Tests whether Firebase Admin can authenticate and send to FCM at all,
-// bypassing Firestore token lookup. Call with:
-//   curl https://resonance-proxy.onrender.com/test-fcm?token=YOUR_FCM_TOKEN
 
 app.get('/test-fcm', async (req, res) => {
   const { token } = req.query;
@@ -342,7 +331,6 @@ app.get('/artist', async (req, res) => {
   }
 });
 
-// Legacy redirects — keep until all Swift call sites are updated to /artist
 app.get('/artist-info', (req, res) => res.redirect(307, `/artist?${new URLSearchParams(req.query)}`));
 app.get('/artists',     (req, res) => res.redirect(307, `/artist?${new URLSearchParams(req.query)}`));
 
@@ -381,7 +369,6 @@ app.get('/album', async (req, res) => {
   }
 });
 
-// Legacy redirects
 app.get('/album-details', (req, res) => res.redirect(307, `/album?${new URLSearchParams(req.query)}`));
 app.get('/full-album',    (req, res) => res.redirect(307, `/album?${new URLSearchParams(req.query)}`));
 
@@ -619,6 +606,101 @@ app.post('/spotify/sync-prompts', async (req, res) => {
     res.json({ synced: limited.length });
   } catch (err) {
     console.error('❌ Sync prompts failed:', err.response?.data || err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Cold Read — Taste-Based Random Album ──────────────────────────────────────
+// Seeds Spotify recommendations from user's top artists.
+// Filters out already-logged albums. Returns one at random.
+
+app.get('/spotify/cold-read-album', async (req, res) => {
+  const { uid } = req.query;
+  if (!uid) return res.status(400).json({ error: 'Missing uid' });
+  try {
+    const token = await getValidUserToken(uid);
+
+    // Fetch top artists for seed
+    const topArtistsRes = await axios.get('https://api.spotify.com/v1/me/top/artists', {
+      headers: { Authorization: `Bearer ${token}` },
+      params:  { limit: 5, time_range: 'medium_term' }
+    });
+    const seedArtists = topArtistsRes.data.items.slice(0, 5).map(a => a.id).join(',');
+    if (!seedArtists) return res.status(404).json({ error: 'No top artists found' });
+
+    // Get recommendations
+    const recsRes = await axios.get('https://api.spotify.com/v1/recommendations', {
+      headers: { Authorization: `Bearer ${token}` },
+      params:  { seed_artists: seedArtists, limit: 20 }
+    });
+
+    // Deduplicate by album
+    const seenIds = new Set();
+    const albums  = [];
+    for (const track of recsRes.data.tracks) {
+      const album = track.album;
+      if (!seenIds.has(album.id)) {
+        seenIds.add(album.id);
+        albums.push({
+          albumId:       album.id,
+          albumTitle:    album.name,
+          albumArtist:   album.artists[0]?.name ?? '',
+          albumCoverURL: album.images[0]?.url   ?? '',
+          artistId:      album.artists[0]?.id   ?? ''
+        });
+      }
+    }
+
+    // Filter out already-logged
+    const diarySnap = await db.collection('users').doc(uid).collection('diaryEntries').get();
+    const loggedIds = new Set(diarySnap.docs.map(d => d.data().albumId));
+    const filtered  = albums.filter(a => !loggedIds.has(a.albumId));
+
+    if (!filtered.length) return res.status(404).json({ error: 'No unlogged recommendations found' });
+
+    const pick = filtered[Math.floor(Math.random() * filtered.length)];
+    res.json(pick);
+  } catch (err) {
+    console.error('❌ Cold read album failed:', err.response?.data || err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Cold Read — From Suggestions ─────────────────────────────────────────────
+// Picks a random album from the user's received suggestions (pending + dismissed).
+// These are albums friends thought you should hear — perfect cold read fodder.
+
+app.get('/spotify/cold-read-suggestion', async (req, res) => {
+  const { uid } = req.query;
+  if (!uid) return res.status(400).json({ error: 'Missing uid' });
+  try {
+    const [diarySnap, suggestionsSnap, userDoc] = await Promise.all([
+      db.collection('users').doc(uid).collection('diaryEntries').get(),
+      db.collection('users').doc(uid).collection('suggestions').get(),
+      db.collection('users').doc(uid).get()
+    ]);
+
+    const loggedIds = new Set(diarySnap.docs.map(d => d.data().albumId));
+
+    // Collect all suggestions (pending and dismissed) that haven't been logged
+    const candidates = suggestionsSnap.docs
+      .map(d => d.data())
+      .filter(s => s.albumId && !loggedIds.has(s.albumId))
+      .map(s => ({
+        albumId:       s.albumId,
+        albumTitle:    s.albumTitle    ?? '',
+        albumArtist:   s.albumArtist   ?? '',
+        albumCoverURL: s.albumCoverURL ?? '',
+        artistId:      s.artistId      ?? '',
+        suggestedBy:   s.fromUsername  ?? ''
+      }));
+
+    if (!candidates.length) return res.status(404).json({ error: 'No unlogged suggestions found' });
+
+    const pick = candidates[Math.floor(Math.random() * candidates.length)];
+    res.json(pick);
+  } catch (err) {
+    console.error('❌ Cold read suggestion failed:', err.response?.data || err.message);
     res.status(500).json({ error: err.message });
   }
 });
