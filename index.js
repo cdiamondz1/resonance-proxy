@@ -24,20 +24,12 @@ let access_token = '';
 async function refreshToken() {
   const clientId     = process.env.SPOTIFY_CLIENT_ID     || process.env.CLIENT_ID;
   const clientSecret = process.env.SPOTIFY_CLIENT_SECRET || process.env.CLIENT_SECRET;
-  if (!clientId || !clientSecret) {
-    console.error('❌ Missing Spotify credentials');
-    return;
-  }
+  if (!clientId || !clientSecret) { console.error('❌ Missing Spotify credentials'); return; }
   try {
     const response = await axios.post(
       'https://accounts.spotify.com/api/token',
       new URLSearchParams({ grant_type: 'client_credentials' }),
-      {
-        headers: {
-          Authorization: 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64'),
-          'Content-Type': 'application/x-www-form-urlencoded'
-        }
-      }
+      { headers: { Authorization: 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64'), 'Content-Type': 'application/x-www-form-urlencoded' } }
     );
     access_token = response.data.access_token;
     console.log('✅ Spotify client token refreshed');
@@ -66,6 +58,15 @@ function isHtmlResponse(data) {
   return typeof data === 'string' && data.includes('<html');
 }
 
+function shuffle(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
 async function getUserTokens(uid) {
   const userDoc = await db.collection('users').doc(uid).get();
   const tokens  = userDoc.data()?.spotifyTokens;
@@ -87,65 +88,36 @@ async function getValidUserToken(uid) {
 
   const response = await axios.post(
     'https://accounts.spotify.com/api/token',
-    new URLSearchParams({
-      grant_type:    'refresh_token',
-      refresh_token: tokens.refreshToken
-    }),
-    {
-      headers: {
-        Authorization: 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64'),
-        'Content-Type': 'application/x-www-form-urlencoded'
-      }
-    }
+    new URLSearchParams({ grant_type: 'refresh_token', refresh_token: tokens.refreshToken }),
+    { headers: { Authorization: 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64'), 'Content-Type': 'application/x-www-form-urlencoded' } }
   );
 
   const newAccessToken = response.data.access_token;
   const newExpiresAt   = admin.firestore.Timestamp.fromMillis(now + response.data.expires_in * 1000);
-
-  await db.collection('users').doc(uid).update({
-    'spotifyTokens.accessToken': newAccessToken,
-    'spotifyTokens.expiresAt':   newExpiresAt
-  });
-
+  await db.collection('users').doc(uid).update({ 'spotifyTokens.accessToken': newAccessToken, 'spotifyTokens.expiresAt': newExpiresAt });
   console.log(`✅ Refreshed Spotify user token for ${uid}`);
   return newAccessToken;
 }
 
 // ── Notification Helpers ──────────────────────────────────────────────────────
 
-const apnsBase = {
-  payload: { aps: { sound: 'default' } }
-};
+const apnsBase = { payload: { aps: { sound: 'default' } } };
 
 async function sendPushNotification(recipientUid, type, payload) {
   const userDoc  = await db.collection('users').doc(recipientUid).get();
   const fcmToken = userDoc.data()?.fcmToken;
-
-  if (!fcmToken) {
-    console.log(`⚠️ No FCM token for ${recipientUid}`);
-    return { sent: false, reason: 'No FCM token' };
-  }
-
+  if (!fcmToken) { console.log(`⚠️ No FCM token for ${recipientUid}`); return { sent: false, reason: 'No FCM token' }; }
   const message = buildMessage(type, payload, fcmToken);
-  if (!message) {
-    console.log(`⚠️ Unknown notification type: ${type}`);
-    return { sent: false, reason: `Unknown type: ${type}` };
-  }
-
+  if (!message) { console.log(`⚠️ Unknown notification type: ${type}`); return { sent: false, reason: `Unknown type: ${type}` }; }
   try {
     const result = await admin.messaging().send(message);
     console.log(`✅ Push sent [${type}] to ${recipientUid}: ${result}`);
     return { sent: true };
   } catch (err) {
-    const staleCodes = [
-      'messaging/registration-token-not-registered',
-      'messaging/invalid-registration-token'
-    ];
+    const staleCodes = ['messaging/registration-token-not-registered', 'messaging/invalid-registration-token'];
     if (staleCodes.includes(err.code)) {
       console.warn(`🗑 Stale FCM token for ${recipientUid} — removing`);
-      await db.collection('users').doc(recipientUid)
-        .update({ fcmToken: admin.firestore.FieldValue.delete() })
-        .catch(() => {});
+      await db.collection('users').doc(recipientUid).update({ fcmToken: admin.firestore.FieldValue.delete() }).catch(() => {});
     } else {
       console.error(`❌ Push failed [${type}] to ${recipientUid}:`, err.message, err.code);
     }
@@ -155,79 +127,16 @@ async function sendPushNotification(recipientUid, type, payload) {
 
 function buildMessage(type, payload, token) {
   const base = { token, apns: apnsBase };
-
   switch (type) {
-    case 'newFollower':
-      return {
-        ...base,
-        notification: { title: `${payload.fromName} followed you`, body: 'Tap to view their profile.' },
-        data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '' }
-      };
-    case 'entryComment':
-      return {
-        ...base,
-        notification: {
-          title: `${payload.fromName} left a note`,
-          body:  payload.albumTitle ? `on your entry for ${payload.albumTitle}` : 'on your entry'
-        },
-        data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '', entryId: payload.entryId ?? '' }
-      };
-    case 'commentReply':
-      return {
-        ...base,
-        notification: {
-          title: `${payload.fromName} replied to you`,
-          body:  payload.albumTitle ? `on ${payload.albumTitle}` : 'on your note'
-        },
-        data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '', entryId: payload.entryId ?? '' }
-      };
-    case 'commentLike':
-      return {
-        ...base,
-        notification: {
-          title: `${payload.fromName} liked your note`,
-          body:  payload.albumTitle ? `on ${payload.albumTitle}` : ''
-        },
-        data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '', entryId: payload.entryId ?? '' }
-      };
-    case 'albumSuggestion':
-      return {
-        ...base,
-        notification: {
-          title: `${payload.fromName} suggested an album`,
-          body:  payload.albumTitle ? `"${payload.albumTitle}" — check it out on their profile` : 'Tap to see what they think you should hear.'
-        },
-        data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '' }
-      };
-    case 'suggestionAgree':
-      return {
-        ...base,
-        notification: {
-          title: `${payload.fromName} agrees`,
-          body:  payload.albumTitle ? `You should really listen to ${payload.albumTitle}` : 'Someone else thinks you should hear this too.'
-        },
-        data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '' }
-      };
-    case 'suggestionReviewed':
-      return {
-        ...base,
-        notification: {
-          title: `${payload.authorName} finally listened`,
-          body:  payload.albumTitle ? `${payload.albumTitle}${payload.ratingString ? ` — ${payload.ratingString}` : ''}` : 'Tap to see their entry.'
-        },
-        data: { type, authorUid: payload.authorUid ?? '', authorName: payload.authorName ?? '', entryId: payload.entryId ?? '' }
-      };
-    case 'weeklyPrompt':
-      return {
-        ...base,
-        notification: {
-          title: "This week's prompt is here",
-          body:  payload.promptText ? `"${payload.promptText}"` : 'Open Resonance to see it.'
-        },
-        data: { type, promptText: payload.promptText ?? '' }
-      };
-    default:
-      return null;
+    case 'newFollower':       return { ...base, notification: { title: `${payload.fromName} followed you`, body: 'Tap to view their profile.' }, data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '' } };
+    case 'entryComment':      return { ...base, notification: { title: `${payload.fromName} left a note`, body: payload.albumTitle ? `on your entry for ${payload.albumTitle}` : 'on your entry' }, data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '', entryId: payload.entryId ?? '' } };
+    case 'commentReply':      return { ...base, notification: { title: `${payload.fromName} replied to you`, body: payload.albumTitle ? `on ${payload.albumTitle}` : 'on your note' }, data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '', entryId: payload.entryId ?? '' } };
+    case 'commentLike':       return { ...base, notification: { title: `${payload.fromName} liked your note`, body: payload.albumTitle ? `on ${payload.albumTitle}` : '' }, data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '', entryId: payload.entryId ?? '' } };
+    case 'albumSuggestion':   return { ...base, notification: { title: `${payload.fromName} suggested an album`, body: payload.albumTitle ? `"${payload.albumTitle}" — check it out on their profile` : 'Tap to see what they think you should hear.' }, data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '' } };
+    case 'suggestionAgree':   return { ...base, notification: { title: `${payload.fromName} agrees`, body: payload.albumTitle ? `You should really listen to ${payload.albumTitle}` : 'Someone else thinks you should hear this too.' }, data: { type, fromUid: payload.fromUid ?? '', fromName: payload.fromName ?? '' } };
+    case 'suggestionReviewed':return { ...base, notification: { title: `${payload.authorName} finally listened`, body: payload.albumTitle ? `${payload.albumTitle}${payload.ratingString ? ` — ${payload.ratingString}` : ''}` : 'Tap to see their entry.' }, data: { type, authorUid: payload.authorUid ?? '', authorName: payload.authorName ?? '', entryId: payload.entryId ?? '' } };
+    case 'weeklyPrompt':      return { ...base, notification: { title: "This week's prompt is here", body: payload.promptText ? `"${payload.promptText}"` : 'Open Resonance to see it.' }, data: { type, promptText: payload.promptText ?? '' } };
+    default: return null;
   }
 }
 
@@ -243,56 +152,33 @@ function getWeekNumber(date) {
 
 function requireNotifySecret(req, res, next) {
   const secret = req.headers['x-notify-secret'];
-  if (!secret || secret !== process.env.NOTIFY_SECRET) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+  if (!secret || secret !== process.env.NOTIFY_SECRET) return res.status(401).json({ error: 'Unauthorized' });
   next();
 }
 
 // ── Root ──────────────────────────────────────────────────────────────────────
 
-app.get('/', (req, res) => {
-  res.send('🎵 Resonance proxy is live');
-});
+app.get('/', (req, res) => res.send('🎵 Resonance proxy is live'));
 
-// ── Debug: Spotify token ──────────────────────────────────────────────────────
+// ── Debug ─────────────────────────────────────────────────────────────────────
 
 app.get('/test-token', async (req, res) => {
-  const clientId     = process.env.SPOTIFY_CLIENT_ID     || process.env.CLIENT_ID;
+  const clientId = process.env.SPOTIFY_CLIENT_ID || process.env.CLIENT_ID;
   const clientSecret = process.env.SPOTIFY_CLIENT_SECRET || process.env.CLIENT_SECRET;
   if (!clientId || !clientSecret) return res.status(500).send('Missing credentials');
   try {
-    const response = await axios.post(
-      'https://accounts.spotify.com/api/token',
-      new URLSearchParams({ grant_type: 'client_credentials' }),
-      {
-        headers: {
-          Authorization: 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64'),
-          'Content-Type': 'application/x-www-form-urlencoded'
-        }
-      }
-    );
+    const response = await axios.post('https://accounts.spotify.com/api/token', new URLSearchParams({ grant_type: 'client_credentials' }), { headers: { Authorization: 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64'), 'Content-Type': 'application/x-www-form-urlencoded' } });
     res.send(response.data);
-  } catch (error) {
-    res.status(500).json({ error: error.response?.data || error.message });
-  }
+  } catch (error) { res.status(500).json({ error: error.response?.data || error.message }); }
 });
-
-// ── Debug: FCM send ───────────────────────────────────────────────────────────
 
 app.get('/test-fcm', async (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).json({ error: 'Missing token query param' });
   try {
-    const result = await admin.messaging().send({
-      token,
-      notification: { title: 'Resonance', body: 'Push is working 🎵' },
-      apns: { payload: { aps: { sound: 'default' } } }
-    });
+    const result = await admin.messaging().send({ token, notification: { title: 'Resonance', body: 'Push is working 🎵' }, apns: { payload: { aps: { sound: 'default' } } } });
     res.json({ ok: true, result });
-  } catch (err) {
-    res.json({ ok: false, error: err.message, code: err.code });
-  }
+  } catch (err) { res.json({ ok: false, error: err.message, code: err.code }); }
 });
 
 // ── Search ────────────────────────────────────────────────────────────────────
@@ -301,18 +187,12 @@ app.get('/search', async (req, res) => {
   const { q, type = 'album' } = req.query;
   if (!q) return res.status(400).json({ error: 'Missing search query' });
   try {
-    const result = await axios.get('https://api.spotify.com/v1/search', {
-      headers: { Authorization: `Bearer ${access_token}` },
-      params:  { q, type }
-    });
+    const result = await axios.get('https://api.spotify.com/v1/search', { headers: { Authorization: `Bearer ${access_token}` }, params: { q, type } });
     if (isHtmlResponse(result.data)) return res.status(503).json({ error: 'Proxy cold start, retry' });
     if (type === 'album')       res.json(result.data.albums.items);
     else if (type === 'artist') res.json(result.data.artists.items);
     else res.status(400).json({ error: `Unsupported type: ${type}` });
-  } catch (error) {
-    console.error('🔍 Search failed:', error.response?.data || error.message);
-    res.status(500).json({ error: error.response?.data || error.message });
-  }
+  } catch (error) { console.error('🔍 Search failed:', error.response?.data || error.message); res.status(500).json({ error: error.response?.data || error.message }); }
 });
 
 // ── Artist ────────────────────────────────────────────────────────────────────
@@ -321,14 +201,10 @@ app.get('/artist', async (req, res) => {
   const { id } = req.query;
   if (!id) return res.status(400).json({ error: 'Missing artist ID' });
   try {
-    const result = await axios.get(`https://api.spotify.com/v1/artists/${id}`, {
-      headers: { Authorization: `Bearer ${access_token}` }
-    });
+    const result = await axios.get(`https://api.spotify.com/v1/artists/${id}`, { headers: { Authorization: `Bearer ${access_token}` } });
     if (isHtmlResponse(result.data)) return res.status(503).json({ error: 'Proxy cold start, retry' });
     res.json(result.data);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+  } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 app.get('/artist-info', (req, res) => res.redirect(307, `/artist?${new URLSearchParams(req.query)}`));
@@ -340,16 +216,10 @@ app.get('/artist-albums', async (req, res) => {
   const { id } = req.query;
   if (!id) return res.status(400).json({ error: 'Missing artist ID' });
   try {
-    const result = await axios.get(`https://api.spotify.com/v1/artists/${id}/albums`, {
-      headers: { Authorization: `Bearer ${access_token}` },
-      params:  { include_groups: 'album', limit: 50 }
-    });
+    const result = await axios.get(`https://api.spotify.com/v1/artists/${id}/albums`, { headers: { Authorization: `Bearer ${access_token}` }, params: { include_groups: 'album', limit: 50 } });
     if (isHtmlResponse(result.data)) return res.status(503).json({ error: 'Proxy cold start, retry' });
     res.json(result.data.items);
-  } catch (error) {
-    console.error('❌ Artist albums fetch failed:', error.response?.data || error.message);
-    res.status(500).json({ error: 'Failed to fetch albums' });
-  }
+  } catch (error) { console.error('❌ Artist albums fetch failed:', error.response?.data || error.message); res.status(500).json({ error: 'Failed to fetch albums' }); }
 });
 
 // ── Album ─────────────────────────────────────────────────────────────────────
@@ -358,15 +228,10 @@ app.get('/album', async (req, res) => {
   const { id } = req.query;
   if (!id) return res.status(400).json({ error: 'Missing album ID' });
   try {
-    const result = await axios.get(`https://api.spotify.com/v1/albums/${id}`, {
-      headers: { Authorization: `Bearer ${access_token}` }
-    });
+    const result = await axios.get(`https://api.spotify.com/v1/albums/${id}`, { headers: { Authorization: `Bearer ${access_token}` } });
     if (isHtmlResponse(result.data)) return res.status(503).json({ error: 'Proxy cold start, retry' });
     res.json(result.data);
-  } catch (error) {
-    console.error('❌ Album fetch failed:', error.response?.data || error.message);
-    res.status(500).json({ error: 'Failed to fetch album' });
-  }
+  } catch (error) { console.error('❌ Album fetch failed:', error.response?.data || error.message); res.status(500).json({ error: 'Failed to fetch album' }); }
 });
 
 app.get('/album-details', (req, res) => res.redirect(307, `/album?${new URLSearchParams(req.query)}`));
@@ -378,15 +243,10 @@ app.get('/album-tracks', async (req, res) => {
   const { id } = req.query;
   if (!id) return res.status(400).json({ error: 'Missing album ID' });
   try {
-    const result = await axios.get(`https://api.spotify.com/v1/albums/${id}/tracks`, {
-      headers: { Authorization: `Bearer ${access_token}` }
-    });
+    const result = await axios.get(`https://api.spotify.com/v1/albums/${id}/tracks`, { headers: { Authorization: `Bearer ${access_token}` } });
     if (isHtmlResponse(result.data)) return res.status(503).json({ error: 'Proxy cold start, retry' });
     res.json(result.data.items);
-  } catch (error) {
-    console.error('❌ Album tracks fetch failed:', error.response?.data || error.message);
-    res.status(500).json({ error: 'Failed to fetch tracks' });
-  }
+  } catch (error) { console.error('❌ Album tracks fetch failed:', error.response?.data || error.message); res.status(500).json({ error: 'Failed to fetch tracks' }); }
 });
 
 // ── OAuth — Get Auth URL ──────────────────────────────────────────────────────
@@ -396,19 +256,8 @@ app.get('/spotify/auth/url', (req, res) => {
   if (!uid) return res.status(400).json({ error: 'Missing uid' });
   const clientId    = process.env.SPOTIFY_CLIENT_ID || process.env.CLIENT_ID;
   const redirectUri = 'https://resonance-proxy.onrender.com/spotify/auth/callback';
-  const scopes = [
-    'user-read-recently-played',
-    'user-top-read',
-    'user-read-currently-playing',
-    'user-read-playback-state'
-  ].join(' ');
-  const params = new URLSearchParams({
-    response_type: 'code',
-    client_id:     clientId,
-    scope:         scopes,
-    redirect_uri:  redirectUri,
-    state:         uid
-  });
+  const scopes = ['user-read-recently-played', 'user-top-read', 'user-read-currently-playing', 'user-read-playback-state'].join(' ');
+  const params = new URLSearchParams({ response_type: 'code', client_id: clientId, scope: scopes, redirect_uri: redirectUri, state: uid });
   res.json({ url: `https://accounts.spotify.com/authorize?${params.toString()}` });
 });
 
@@ -422,35 +271,13 @@ app.get('/spotify/auth/callback', async (req, res) => {
   const clientSecret = process.env.SPOTIFY_CLIENT_SECRET || process.env.CLIENT_SECRET;
   const redirectUri  = 'https://resonance-proxy.onrender.com/spotify/auth/callback';
   try {
-    const response = await axios.post(
-      'https://accounts.spotify.com/api/token',
-      new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: redirectUri }),
-      {
-        headers: {
-          Authorization: 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64'),
-          'Content-Type': 'application/x-www-form-urlencoded'
-        }
-      }
-    );
+    const response = await axios.post('https://accounts.spotify.com/api/token', new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: redirectUri }), { headers: { Authorization: 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64'), 'Content-Type': 'application/x-www-form-urlencoded' } });
     const { access_token: accessToken, refresh_token: refreshToken, expires_in } = response.data;
     const expiresAt = admin.firestore.Timestamp.fromMillis(Date.now() + expires_in * 1000);
-    await db.collection('users').doc(uid).update({
-      spotifyTokens:    { accessToken, refreshToken, expiresAt },
-      spotifyConnected: true
-    });
+    await db.collection('users').doc(uid).update({ spotifyTokens: { accessToken, refreshToken, expiresAt }, spotifyConnected: true });
     console.log(`✅ Spotify connected for user ${uid}`);
-    res.send(`
-      <html>
-        <body style="font-family: sans-serif; text-align: center; padding: 60px; background: #080e1a; color: #f7cc3a;">
-          <h2>Spotify connected ✓</h2>
-          <p style="color: white;">You can close this window and return to Resonance.</p>
-        </body>
-      </html>
-    `);
-  } catch (err) {
-    console.error('❌ Token exchange failed:', err.response?.data || err.message);
-    res.status(500).send('Failed to connect Spotify. Please try again.');
-  }
+    res.send(`<html><body style="font-family: sans-serif; text-align: center; padding: 60px; background: #080e1a; color: #f7cc3a;"><h2>Spotify connected ✓</h2><p style="color: white;">You can close this window and return to Resonance.</p></body></html>`);
+  } catch (err) { console.error('❌ Token exchange failed:', err.response?.data || err.message); res.status(500).send('Failed to connect Spotify. Please try again.'); }
 });
 
 // ── OAuth — Disconnect ────────────────────────────────────────────────────────
@@ -459,17 +286,10 @@ app.post('/spotify/auth/disconnect', async (req, res) => {
   const { uid } = req.body;
   if (!uid) return res.status(400).json({ error: 'Missing uid' });
   try {
-    await db.collection('users').doc(uid).update({
-      spotifyTokens:     admin.firestore.FieldValue.delete(),
-      spotifyConnected:  false,
-      currentlySpinning: admin.firestore.FieldValue.delete()
-    });
+    await db.collection('users').doc(uid).update({ spotifyTokens: admin.firestore.FieldValue.delete(), spotifyConnected: false, currentlySpinning: admin.firestore.FieldValue.delete() });
     console.log(`✅ Spotify disconnected for user ${uid}`);
     res.json({ success: true });
-  } catch (err) {
-    console.error('❌ Disconnect failed:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { console.error('❌ Disconnect failed:', err.message); res.status(500).json({ error: err.message }); }
 });
 
 // ── User — Recently Played ────────────────────────────────────────────────────
@@ -479,10 +299,7 @@ app.get('/spotify/recently-played', async (req, res) => {
   if (!uid) return res.status(400).json({ error: 'Missing uid' });
   try {
     const token  = await getValidUserToken(uid);
-    const result = await axios.get('https://api.spotify.com/v1/me/player/recently-played', {
-      headers: { Authorization: `Bearer ${token}` },
-      params:  { limit: 50 }
-    });
+    const result = await axios.get('https://api.spotify.com/v1/me/player/recently-played', { headers: { Authorization: `Bearer ${token}` }, params: { limit: 50 } });
     if (isHtmlResponse(result.data)) return res.status(503).json({ error: 'Proxy cold start, retry' });
     const seenAlbumIds = new Set();
     const albums = [];
@@ -490,20 +307,11 @@ app.get('/spotify/recently-played', async (req, res) => {
       const album = item.track.album;
       if (!seenAlbumIds.has(album.id)) {
         seenAlbumIds.add(album.id);
-        albums.push({
-          albumId:       album.id,
-          albumTitle:    album.name,
-          albumArtist:   album.artists[0]?.name ?? '',
-          albumCoverURL: album.images[0]?.url   ?? '',
-          lastPlayedAt:  item.played_at
-        });
+        albums.push({ albumId: album.id, albumTitle: album.name, albumArtist: album.artists[0]?.name ?? '', albumCoverURL: album.images[0]?.url ?? '', lastPlayedAt: item.played_at });
       }
     }
     res.json(albums);
-  } catch (err) {
-    console.error('❌ Recently played failed:', err.response?.data || err.message);
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { console.error('❌ Recently played failed:', err.response?.data || err.message); res.status(500).json({ error: err.message }); }
 });
 
 // ── User — Currently Playing ──────────────────────────────────────────────────
@@ -513,9 +321,7 @@ app.get('/spotify/currently-playing', async (req, res) => {
   if (!uid) return res.status(400).json({ error: 'Missing uid' });
   try {
     const token  = await getValidUserToken(uid);
-    const result = await axios.get('https://api.spotify.com/v1/me/player/currently-playing', {
-      headers: { Authorization: `Bearer ${token}` }
-    });
+    const result = await axios.get('https://api.spotify.com/v1/me/player/currently-playing', { headers: { Authorization: `Bearer ${token}` } });
     if (!result.data || result.status === 204) {
       await db.collection('users').doc(uid).update({ currentlySpinning: admin.firestore.FieldValue.delete() });
       return res.json({ playing: false });
@@ -524,20 +330,10 @@ app.get('/spotify/currently-playing', async (req, res) => {
     const track = result.data.item;
     const album = track?.album;
     if (!album) return res.json({ playing: false });
-    const currentlySpinning = {
-      albumId:       album.id,
-      albumTitle:    album.name,
-      albumArtist:   album.artists[0]?.name ?? '',
-      albumCoverURL: album.images[0]?.url   ?? '',
-      trackTitle:    track.name,
-      updatedAt:     admin.firestore.Timestamp.now()
-    };
+    const currentlySpinning = { albumId: album.id, albumTitle: album.name, albumArtist: album.artists[0]?.name ?? '', albumCoverURL: album.images[0]?.url ?? '', trackTitle: track.name, updatedAt: admin.firestore.Timestamp.now() };
     await db.collection('users').doc(uid).update({ currentlySpinning });
     res.json({ playing: true, ...currentlySpinning });
-  } catch (err) {
-    console.error('❌ Currently playing failed:', err.response?.data || err.message);
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { console.error('❌ Currently playing failed:', err.response?.data || err.message); res.status(500).json({ error: err.message }); }
 });
 
 // ── User — Top Artists ────────────────────────────────────────────────────────
@@ -547,16 +343,10 @@ app.get('/spotify/top-artists', async (req, res) => {
   if (!uid) return res.status(400).json({ error: 'Missing uid' });
   try {
     const token  = await getValidUserToken(uid);
-    const result = await axios.get('https://api.spotify.com/v1/me/top/artists', {
-      headers: { Authorization: `Bearer ${token}` },
-      params:  { limit: 50, time_range }
-    });
+    const result = await axios.get('https://api.spotify.com/v1/me/top/artists', { headers: { Authorization: `Bearer ${token}` }, params: { limit: 50, time_range } });
     if (isHtmlResponse(result.data)) return res.status(503).json({ error: 'Proxy cold start, retry' });
     res.json(result.data.items);
-  } catch (err) {
-    console.error('❌ Top artists failed:', err.response?.data || err.message);
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { console.error('❌ Top artists failed:', err.response?.data || err.message); res.status(500).json({ error: err.message }); }
 });
 
 // ── User — Sync Spotify Prompts ───────────────────────────────────────────────
@@ -566,10 +356,7 @@ app.post('/spotify/sync-prompts', async (req, res) => {
   if (!uid) return res.status(400).json({ error: 'Missing uid' });
   try {
     const token  = await getValidUserToken(uid);
-    const result = await axios.get('https://api.spotify.com/v1/me/player/recently-played', {
-      headers: { Authorization: `Bearer ${token}` },
-      params:  { limit: 50 }
-    });
+    const result = await axios.get('https://api.spotify.com/v1/me/player/recently-played', { headers: { Authorization: `Bearer ${token}` }, params: { limit: 50 } });
     if (isHtmlResponse(result.data)) return res.status(503).json({ error: 'Proxy cold start, retry' });
     const [diarySnap, userDoc] = await Promise.all([
       db.collection('users').doc(uid).collection('diaryEntries').get(),
@@ -583,14 +370,7 @@ app.post('/spotify/sync-prompts', async (req, res) => {
       const album = item.track.album;
       if (!seenAlbumIds.has(album.id) && !loggedAlbumIds.has(album.id) && !dismissed.has(album.id)) {
         seenAlbumIds.add(album.id);
-        candidates.push({
-          albumId:       album.id,
-          albumTitle:    album.name,
-          albumArtist:   album.artists[0]?.name ?? '',
-          albumCoverURL: album.images[0]?.url   ?? '',
-          lastPlayedAt:  admin.firestore.Timestamp.fromDate(new Date(item.played_at)),
-          createdAt:     admin.firestore.Timestamp.now()
-        });
+        candidates.push({ albumId: album.id, albumTitle: album.name, albumArtist: album.artists[0]?.name ?? '', albumCoverURL: album.images[0]?.url ?? '', lastPlayedAt: admin.firestore.Timestamp.fromDate(new Date(item.played_at)), createdAt: admin.firestore.Timestamp.now() });
       }
     }
     const limited = candidates.slice(0, 10);
@@ -604,15 +384,12 @@ app.post('/spotify/sync-prompts', async (req, res) => {
     await batch.commit();
     console.log(`✅ Synced ${limited.length} Spotify prompts for user ${uid}`);
     res.json({ synced: limited.length });
-  } catch (err) {
-    console.error('❌ Sync prompts failed:', err.response?.data || err.message);
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { console.error('❌ Sync prompts failed:', err.response?.data || err.message); res.status(500).json({ error: err.message }); }
 });
 
 // ── Cold Read — Taste-Based Random Album ──────────────────────────────────────
-// Seeds Spotify recommendations from user's top artists.
-// Filters out already-logged albums. Returns one at random.
+// Seeds recommendations from top artists across all three time ranges plus top
+// tracks. Runs up to 4 seed combinations in parallel for maximum variety.
 
 app.get('/spotify/cold-read-album', async (req, res) => {
   const { uid } = req.query;
@@ -620,46 +397,85 @@ app.get('/spotify/cold-read-album', async (req, res) => {
   try {
     const token = await getValidUserToken(uid);
 
-    // Fetch top artists for seed
-    const topArtistsRes = await axios.get('https://api.spotify.com/v1/me/top/artists', {
-      headers: { Authorization: `Bearer ${token}` },
-      params:  { limit: 5, time_range: 'medium_term' }
-    });
-    const seedArtists = topArtistsRes.data.items.slice(0, 5).map(a => a.id).join(',');
-    if (!seedArtists) return res.status(404).json({ error: 'No top artists found' });
+    const diarySnap = await db.collection('users').doc(uid).collection('diaryEntries').get();
+    const loggedIds = new Set(diarySnap.docs.map(d => d.data().albumId).filter(Boolean));
 
-    // Get recommendations
-    const recsRes = await axios.get('https://api.spotify.com/v1/recommendations', {
-      headers: { Authorization: `Bearer ${token}` },
-      params:  { seed_artists: seedArtists, limit: 20 }
-    });
+    // Fetch top artists (all 3 ranges) + top tracks in parallel
+    const [shortArtists, mediumArtists, longArtists, longTracks] = await Promise.allSettled([
+      axios.get('https://api.spotify.com/v1/me/top/artists', { headers: { Authorization: `Bearer ${token}` }, params: { limit: 10, time_range: 'short_term'  } }),
+      axios.get('https://api.spotify.com/v1/me/top/artists', { headers: { Authorization: `Bearer ${token}` }, params: { limit: 10, time_range: 'medium_term' } }),
+      axios.get('https://api.spotify.com/v1/me/top/artists', { headers: { Authorization: `Bearer ${token}` }, params: { limit: 10, time_range: 'long_term'   } }),
+      axios.get('https://api.spotify.com/v1/me/top/tracks',  { headers: { Authorization: `Bearer ${token}` }, params: { limit: 10, time_range: 'long_term'   } })
+    ]);
 
-    // Deduplicate by album
-    const seenIds = new Set();
-    const albums  = [];
-    for (const track of recsRes.data.tracks) {
-      const album = track.album;
-      if (!seenIds.has(album.id)) {
-        seenIds.add(album.id);
-        albums.push({
-          albumId:       album.id,
-          albumTitle:    album.name,
-          albumArtist:   album.artists[0]?.name ?? '',
-          albumCoverURL: album.images[0]?.url   ?? '',
-          artistId:      album.artists[0]?.id   ?? ''
-        });
+    const artistIdSet = new Set();
+    for (const r of [shortArtists, mediumArtists, longArtists]) {
+      if (r.status === 'fulfilled') r.value.data.items.forEach(a => artistIdSet.add(a.id));
+    }
+
+    const trackIdSet = new Set();
+    if (longTracks.status === 'fulfilled') longTracks.value.data.items.forEach(t => trackIdSet.add(t.id));
+
+    const allArtistIds = [...artistIdSet];
+    const allTrackIds  = [...trackIdSet];
+
+    if (!allArtistIds.length && !allTrackIds.length)
+      return res.status(404).json({ error: 'No listening history found on your Spotify account.' });
+
+    // Build up to 4 seed combinations — Spotify caps at 5 seeds per call
+    const seedCombinations = [];
+
+    if (allArtistIds.length >= 3 && allTrackIds.length >= 2)
+      seedCombinations.push({ seed_artists: shuffle(allArtistIds).slice(0, 3).join(','), seed_tracks: shuffle(allTrackIds).slice(0, 2).join(',') });
+
+    if (allArtistIds.length >= 5)
+      seedCombinations.push({ seed_artists: shuffle(allArtistIds).slice(0, 5).join(',') });
+
+    if (allTrackIds.length >= 5)
+      seedCombinations.push({ seed_tracks: shuffle(allTrackIds).slice(0, 5).join(',') });
+
+    if (longArtists.status === 'fulfilled' && longArtists.value.data.items.length >= 5)
+      seedCombinations.push({ seed_artists: longArtists.value.data.items.slice(0, 5).map(a => a.id).join(',') });
+
+    // Fallback: use whatever seeds exist
+    if (!seedCombinations.length) {
+      const params = {};
+      if (allArtistIds.length) params.seed_artists = allArtistIds.slice(0, 3).join(',');
+      if (allTrackIds.length)  params.seed_tracks  = allTrackIds.slice(0, 2).join(',');
+      seedCombinations.push(params);
+    }
+
+    // Fire all combinations in parallel
+    const recResults = await Promise.allSettled(
+      seedCombinations.map(params =>
+        axios.get('https://api.spotify.com/v1/recommendations', {
+          headers: { Authorization: `Bearer ${token}` },
+          params:  { ...params, limit: 20 }
+        })
+      )
+    );
+
+    const seenAlbumIds = new Set();
+    const candidates   = [];
+
+    for (const result of recResults) {
+      if (result.status !== 'fulfilled') continue;
+      for (const track of result.value.data.tracks) {
+        const album = track.album;
+        if (!seenAlbumIds.has(album.id) && !loggedIds.has(album.id)) {
+          seenAlbumIds.add(album.id);
+          candidates.push({ albumId: album.id, albumTitle: album.name, albumArtist: album.artists[0]?.name ?? '', albumCoverURL: album.images[0]?.url ?? '', artistId: album.artists[0]?.id ?? '' });
+        }
       }
     }
 
-    // Filter out already-logged
-    const diarySnap = await db.collection('users').doc(uid).collection('diaryEntries').get();
-    const loggedIds = new Set(diarySnap.docs.map(d => d.data().albumId));
-    const filtered  = albums.filter(a => !loggedIds.has(a.albumId));
+    if (!candidates.length)
+      return res.status(404).json({ error: "You've already logged everything Spotify recommended. Try again in a few days." });
 
-    if (!filtered.length) return res.status(404).json({ error: 'No unlogged recommendations found' });
-
-    const pick = filtered[Math.floor(Math.random() * filtered.length)];
+    const pick = candidates[Math.floor(Math.random() * candidates.length)];
+    console.log(`✅ Cold read: "${pick.albumTitle}" by ${pick.albumArtist} (${candidates.length} candidates)`);
     res.json(pick);
+
   } catch (err) {
     console.error('❌ Cold read album failed:', err.response?.data || err.message);
     res.status(500).json({ error: err.message });
@@ -667,58 +483,35 @@ app.get('/spotify/cold-read-album', async (req, res) => {
 });
 
 // ── Cold Read — From Suggestions ─────────────────────────────────────────────
-// Picks a random album from the user's received suggestions (pending + dismissed).
-// These are albums friends thought you should hear — perfect cold read fodder.
 
 app.get('/spotify/cold-read-suggestion', async (req, res) => {
   const { uid } = req.query;
   if (!uid) return res.status(400).json({ error: 'Missing uid' });
   try {
-    const [diarySnap, suggestionsSnap, userDoc] = await Promise.all([
+    const [diarySnap, suggestionsSnap] = await Promise.all([
       db.collection('users').doc(uid).collection('diaryEntries').get(),
-      db.collection('users').doc(uid).collection('suggestions').get(),
-      db.collection('users').doc(uid).get()
+      db.collection('users').doc(uid).collection('suggestions').get()
     ]);
-
-    const loggedIds = new Set(diarySnap.docs.map(d => d.data().albumId));
-
-    // Collect all suggestions (pending and dismissed) that haven't been logged
+    const loggedIds  = new Set(diarySnap.docs.map(d => d.data().albumId));
     const candidates = suggestionsSnap.docs
       .map(d => d.data())
       .filter(s => s.albumId && !loggedIds.has(s.albumId))
-      .map(s => ({
-        albumId:       s.albumId,
-        albumTitle:    s.albumTitle    ?? '',
-        albumArtist:   s.albumArtist   ?? '',
-        albumCoverURL: s.albumCoverURL ?? '',
-        artistId:      s.artistId      ?? '',
-        suggestedBy:   s.fromUsername  ?? ''
-      }));
-
+      .map(s => ({ albumId: s.albumId, albumTitle: s.albumTitle ?? '', albumArtist: s.albumArtist ?? '', albumCoverURL: s.albumCoverURL ?? '', artistId: s.artistId ?? '', suggestedBy: s.fromUsername ?? '' }));
     if (!candidates.length) return res.status(404).json({ error: 'No unlogged suggestions found' });
-
     const pick = candidates[Math.floor(Math.random() * candidates.length)];
     res.json(pick);
-  } catch (err) {
-    console.error('❌ Cold read suggestion failed:', err.response?.data || err.message);
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { console.error('❌ Cold read suggestion failed:', err.response?.data || err.message); res.status(500).json({ error: err.message }); }
 });
 
 // ── Push Notifications ────────────────────────────────────────────────────────
 
 app.post('/notify', requireNotifySecret, async (req, res) => {
   const { recipientUid, type, ...payload } = req.body;
-  if (!recipientUid || !type) {
-    return res.status(400).json({ error: 'Missing recipientUid or type' });
-  }
+  if (!recipientUid || !type) return res.status(400).json({ error: 'Missing recipientUid or type' });
   try {
     const result = await sendPushNotification(recipientUid, type, payload);
     res.json(result);
-  } catch (err) {
-    console.error(`❌ /notify unhandled error [${type}] → ${recipientUid}:`, err.message);
-    res.status(500).json({ sent: false, reason: err.message });
-  }
+  } catch (err) { console.error(`❌ /notify unhandled error [${type}] → ${recipientUid}:`, err.message); res.status(500).json({ sent: false, reason: err.message }); }
 });
 
 // ── Weekly Prompt Push ────────────────────────────────────────────────────────
@@ -738,24 +531,14 @@ app.post('/notify/weekly-prompt', requireNotifySecret, async (req, res) => {
     for (let i = 0; i < tokens.length; i += 500) chunks.push(tokens.slice(i, i + 500));
     let totalSent = 0;
     for (const chunk of chunks) {
-      const response = await admin.messaging().sendEachForMulticast({
-        tokens: chunk,
-        notification: { title: "This week's prompt is here", body: `"${promptText}"` },
-        data: { type: 'weeklyPrompt', promptText },
-        apns: { payload: { aps: { sound: 'default' } } }
-      });
+      const response = await admin.messaging().sendEachForMulticast({ tokens: chunk, notification: { title: "This week's prompt is here", body: `"${promptText}"` }, data: { type: 'weeklyPrompt', promptText }, apns: { payload: { aps: { sound: 'default' } } } });
       totalSent += response.successCount;
       console.log(`✅ Weekly prompt batch: ${response.successCount}/${chunk.length} sent`);
     }
     res.json({ sent: totalSent, weekId, promptText });
-  } catch (err) {
-    console.error('❌ Weekly prompt push failed:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { console.error('❌ Weekly prompt push failed:', err.message); res.status(500).json({ error: err.message }); }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-app.listen(PORT, () => {
-  console.log(`🚀 Resonance proxy running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 Resonance proxy running on port ${PORT}`));
