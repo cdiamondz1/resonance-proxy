@@ -574,7 +574,7 @@ app.post('/admin/backfill-name-lower', async (req, res) => {
     for (const doc of snap.docs) {
       const name = doc.data().name;
       if (!name || typeof name !== 'string') { skipped++; continue; }
-      const nameLower = name.toLowerCase();
+      const nameLower = name.trim().toLowerCase();
       if (doc.data().nameLower === nameLower) { skipped++; continue; }
       batch.update(doc.ref, { nameLower });
       updated++;
@@ -617,7 +617,7 @@ db.collection('users')
       const data = doc.data();
       const name = data.name;
       if (!name || typeof name !== 'string') return;
-      const nameLower = name.toLowerCase();
+      const nameLower = name.trim().toLowerCase();
       if (data.nameLower === nameLower) return;
       try {
         await doc.ref.update({ nameLower });
