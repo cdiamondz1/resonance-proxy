@@ -389,19 +389,6 @@ app.post('/spotify/sync-prompts', async (req, res) => {
 });
 
 // ── Cold Read — Artist Deep Cuts ──────────────────────────────────────────────
-// Finds unlogged albums by artists the user already loves.
-//
-// Primary path:
-//   1. Fetch top artists across all three time ranges (up to 30 unique artists)
-//   2. For each artist fetch their full discography in parallel
-//   3. Filter out already-logged albums
-//   4. Pick one at random — this is a blind spot in their own taste map
-//
-// Fallback (if all top-artist albums are logged):
-//   1. Take a random sample of top artists
-//   2. Fetch their related artists
-//   3. Pull discographies from those related artists
-//   4. Filter and pick — one degree of separation from their taste
 
 app.get('/spotify/cold-read-album', async (req, res) => {
   const { uid } = req.query;
@@ -410,18 +397,16 @@ app.get('/spotify/cold-read-album', async (req, res) => {
   try {
     const token = await getValidUserToken(uid);
 
-    // Load logged album IDs
     const diarySnap = await db.collection('users').doc(uid).collection('diaryEntries').get();
     const loggedIds = new Set(diarySnap.docs.map(d => d.data().albumId).filter(Boolean));
 
-    // ── Step 1: Collect top artists across all three time ranges ──────────────
     const [shortRes, mediumRes, longRes] = await Promise.allSettled([
       axios.get('https://api.spotify.com/v1/me/top/artists', { headers: { Authorization: `Bearer ${token}` }, params: { limit: 10, time_range: 'short_term'  } }),
       axios.get('https://api.spotify.com/v1/me/top/artists', { headers: { Authorization: `Bearer ${token}` }, params: { limit: 10, time_range: 'medium_term' } }),
       axios.get('https://api.spotify.com/v1/me/top/artists', { headers: { Authorization: `Bearer ${token}` }, params: { limit: 10, time_range: 'long_term'   } })
     ]);
 
-    const artistMap = new Map(); // id → name, deduped
+    const artistMap = new Map();
     for (const r of [shortRes, mediumRes, longRes]) {
       if (r.status === 'fulfilled') {
         for (const a of r.value.data.items) {
@@ -431,14 +416,10 @@ app.get('/spotify/cold-read-album', async (req, res) => {
     }
 
     const topArtistIds = [...artistMap.keys()];
-
-    if (!topArtistIds.length) {
-      return res.status(404).json({ error: 'No listening history found on your Spotify account.' });
-    }
+    if (!topArtistIds.length) return res.status(404).json({ error: 'No listening history found on your Spotify account.' });
 
     console.log(`🎵 Found ${topArtistIds.length} unique top artists`);
 
-    // ── Step 2: Fetch discographies for all top artists in parallel ───────────
     const discographyResults = await Promise.allSettled(
       topArtistIds.map(id =>
         axios.get(`https://api.spotify.com/v1/artists/${id}/albums`, {
@@ -448,7 +429,6 @@ app.get('/spotify/cold-read-album', async (req, res) => {
       )
     );
 
-    // ── Step 3: Build candidate pool — unlogged albums only ──────────────────
     const seenAlbumIds = new Set();
     let candidates = [];
 
@@ -458,47 +438,31 @@ app.get('/spotify/cold-read-album', async (req, res) => {
       for (const album of albums) {
         if (!seenAlbumIds.has(album.id) && !loggedIds.has(album.id)) {
           seenAlbumIds.add(album.id);
-          candidates.push({
-            albumId:       album.id,
-            albumTitle:    album.name,
-            albumArtist:   album.artists[0]?.name ?? artistName,
-            albumCoverURL: album.images[0]?.url   ?? '',
-            artistId:      album.artists[0]?.id   ?? ''
-          });
+          candidates.push({ albumId: album.id, albumTitle: album.name, albumArtist: album.artists[0]?.name ?? artistName, albumCoverURL: album.images[0]?.url ?? '', artistId: album.artists[0]?.id ?? '' });
         }
       }
     }
 
     console.log(`🎯 Primary pool: ${candidates.length} unlogged albums from ${topArtistIds.length} top artists`);
 
-    // ── Fallback: related artists one degree out ──────────────────────────────
     if (candidates.length === 0) {
       console.log('⚠️ All top-artist albums logged — expanding to related artists');
-
-      // Sample 5 random top artists to seed related artist lookup
       const seedArtists = shuffle(topArtistIds).slice(0, 5);
-
       const relatedResults = await Promise.allSettled(
         seedArtists.map(id =>
-          axios.get(`https://api.spotify.com/v1/artists/${id}/related-artists`, {
-            headers: { Authorization: `Bearer ${token}` }
-          }).then(r => r.data.artists.slice(0, 5)) // top 5 related per seed
+          axios.get(`https://api.spotify.com/v1/artists/${id}/related-artists`, { headers: { Authorization: `Bearer ${token}` } })
+            .then(r => r.data.artists.slice(0, 5))
         )
       );
-
       const relatedArtistMap = new Map();
       for (const r of relatedResults) {
         if (r.status !== 'fulfilled') continue;
         for (const a of r.value) {
-          if (!artistMap.has(a.id)) { // skip artists they already follow
-            relatedArtistMap.set(a.id, a.name);
-          }
+          if (!artistMap.has(a.id)) relatedArtistMap.set(a.id, a.name);
         }
       }
-
       const relatedArtistIds = [...relatedArtistMap.keys()];
       console.log(`🔗 Found ${relatedArtistIds.length} related artists`);
-
       const relatedDiscResults = await Promise.allSettled(
         relatedArtistIds.map(id =>
           axios.get(`https://api.spotify.com/v1/artists/${id}/albums`, {
@@ -507,32 +471,20 @@ app.get('/spotify/cold-read-album', async (req, res) => {
           }).then(r => ({ artistId: id, artistName: relatedArtistMap.get(id), albums: r.data.items }))
         )
       );
-
       for (const result of relatedDiscResults) {
         if (result.status !== 'fulfilled') continue;
         const { artistName, albums } = result.value;
         for (const album of albums) {
           if (!seenAlbumIds.has(album.id) && !loggedIds.has(album.id)) {
             seenAlbumIds.add(album.id);
-            candidates.push({
-              albumId:       album.id,
-              albumTitle:    album.name,
-              albumArtist:   album.artists[0]?.name ?? artistName,
-              albumCoverURL: album.images[0]?.url   ?? '',
-              artistId:      album.artists[0]?.id   ?? ''
-            });
+            candidates.push({ albumId: album.id, albumTitle: album.name, albumArtist: album.artists[0]?.name ?? artistName, albumCoverURL: album.images[0]?.url ?? '', artistId: album.artists[0]?.id ?? '' });
           }
         }
       }
-
       console.log(`🎯 Fallback pool: ${candidates.length} unlogged albums from related artists`);
     }
 
-    if (candidates.length === 0) {
-      return res.status(404).json({
-        error: "You've logged everything by your top artists and their related artists. Impressive."
-      });
-    }
+    if (candidates.length === 0) return res.status(404).json({ error: "You've logged everything by your top artists and their related artists. Impressive." });
 
     const pick = candidates[Math.floor(Math.random() * candidates.length)];
     console.log(`✅ Cold read: "${pick.albumTitle}" by ${pick.albumArtist} (${candidates.length} candidates)`);
@@ -600,6 +552,83 @@ app.post('/notify/weekly-prompt', requireNotifySecret, async (req, res) => {
     res.json({ sent: totalSent, weekId, promptText });
   } catch (err) { console.error('❌ Weekly prompt push failed:', err.message); res.status(500).json({ error: err.message }); }
 });
+
+// ── Lineage — Backfill nameLower ──────────────────────────────────────────────
+// One-time endpoint. Hit it once after deploying to write nameLower on all
+// existing user documents. Safe to call again — skips docs that already match.
+// Remove or gate behind a secret after running.
+
+app.post('/admin/backfill-name-lower', async (req, res) => {
+  const secret = req.headers['x-admin-secret'];
+  if (!secret || secret !== process.env.NOTIFY_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  try {
+    const snap    = await db.collection('users').get();
+    const batches = [];
+    let   batch   = db.batch();
+    let   opCount = 0;
+    let   updated = 0;
+    let   skipped = 0;
+
+    for (const doc of snap.docs) {
+      const name = doc.data().name;
+      if (!name || typeof name !== 'string') { skipped++; continue; }
+      const nameLower = name.toLowerCase();
+      if (doc.data().nameLower === nameLower) { skipped++; continue; }
+      batch.update(doc.ref, { nameLower });
+      updated++;
+      opCount++;
+      // Firestore batch limit is 500 ops
+      if (opCount === 500) {
+        batches.push(batch.commit());
+        batch   = db.batch();
+        opCount = 0;
+      }
+    }
+
+    if (opCount > 0) batches.push(batch.commit());
+    await Promise.all(batches);
+
+    console.log(`✅ backfill-name-lower: ${updated} updated, ${skipped} skipped`);
+    res.json({ updated, skipped });
+  } catch (err) {
+    console.error('❌ backfill-name-lower failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Lineage — On User Created: write nameLower ────────────────────────────────
+// New users get nameLower written automatically via the Firestore onCreate
+// listener below. This runs server-side so the client never has to think
+// about it.
+//
+// Since this is an Express server (not Firebase Functions), we simulate the
+// trigger with a Firestore onSnapshot on the users collection filtered to
+// docs created in the last 60 seconds. Lightweight — one listener, no polling.
+
+const nameWatchStart = Date.now();
+db.collection('users')
+  .where('createdAt', '>', admin.firestore.Timestamp.fromMillis(nameWatchStart))
+  .onSnapshot((snap) => {
+    snap.docChanges().forEach(async (change) => {
+      if (change.type !== 'added') return;
+      const doc  = change.doc;
+      const data = doc.data();
+      const name = data.name;
+      if (!name || typeof name !== 'string') return;
+      const nameLower = name.toLowerCase();
+      if (data.nameLower === nameLower) return;
+      try {
+        await doc.ref.update({ nameLower });
+        console.log(`✅ nameLower written for new user ${doc.id}: "${nameLower}"`);
+      } catch (err) {
+        console.error(`❌ nameLower write failed for ${doc.id}:`, err.message);
+      }
+    });
+  }, (err) => {
+    console.error('❌ nameLower watcher error:', err.message);
+  });
 
 // ─────────────────────────────────────────────────────────────────────────────
 
