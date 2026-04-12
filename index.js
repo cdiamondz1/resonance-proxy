@@ -553,10 +553,7 @@ app.post('/notify/weekly-prompt', requireNotifySecret, async (req, res) => {
   } catch (err) { console.error('❌ Weekly prompt push failed:', err.message); res.status(500).json({ error: err.message }); }
 });
 
-// ── Lineage — Backfill nameLower ──────────────────────────────────────────────
-// One-time endpoint. Hit it once after deploying to write nameLower on all
-// existing user documents. Safe to call again — skips docs that already match.
-// Remove or gate behind a secret after running.
+// ── Admin — Backfill nameLower ────────────────────────────────────────────────
 
 app.post('/admin/backfill-name-lower', async (req, res) => {
   const secret = req.headers['x-admin-secret'];
@@ -579,7 +576,6 @@ app.post('/admin/backfill-name-lower', async (req, res) => {
       batch.update(doc.ref, { nameLower });
       updated++;
       opCount++;
-      // Firestore batch limit is 500 ops
       if (opCount === 500) {
         batches.push(batch.commit());
         batch   = db.batch();
@@ -598,14 +594,101 @@ app.post('/admin/backfill-name-lower', async (req, res) => {
   }
 });
 
+// ── Admin — Backfill Zodiac Axis3 ─────────────────────────────────────────────
+// Computes deep/broad for all users who have zodiacType but no zodiacAxis3.
+// Safe to re-run — skips users who already have zodiacAxis3 set.
+// Run once after deploying the 16-type Zodiac update.
+
+app.post('/admin/backfill-zodiac-axis3', async (req, res) => {
+  const secret = req.headers['x-admin-secret'];
+  if (!secret || secret !== process.env.NOTIFY_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  try {
+    const snap = await db.collection('users').where('zodiacType', '!=', '').get();
+
+    let processed = 0;
+    let skipped   = 0;
+    let errors    = 0;
+    const batches = [];
+    let batch     = db.batch();
+    let opCount   = 0;
+
+    for (const userDoc of snap.docs) {
+      const data = userDoc.data();
+
+      // Skip if already backfilled or below threshold
+      if (data.zodiacAxis3)          { skipped++; continue; }
+      if ((data.logCount ?? 0) < 8)  { skipped++; continue; }
+
+      try {
+        const entriesSnap = await db
+          .collection('users')
+          .doc(userDoc.id)
+          .collection('diaryEntries')
+          .get();
+
+        const artistWeights = {};
+        let totalWeight = 0;
+
+        for (const doc of entriesSnap.docs) {
+          const e = doc.data();
+
+          // Handle both legacy int rating (stored > 10) and current double
+          let rating;
+          if (typeof e.rating === 'number') {
+            rating = e.rating > 10
+              ? Math.round((e.rating / 10) * 2) / 2
+              : e.rating;
+          } else {
+            continue;
+          }
+
+          const isRelisten = e.isFirstListen === false;
+          const baseWeight = Math.pow(Math.max(rating, 0) / 10, 1.5);
+          const weight     = baseWeight * (isRelisten ? 1.5 : 1.0);
+          const artist     = (e.albumArtist ?? '').trim().toLowerCase();
+          if (!artist) continue;
+
+          artistWeights[artist] = (artistWeights[artist] ?? 0) + weight;
+          totalWeight += weight;
+        }
+
+        let axis3 = 'broad';
+        if (totalWeight > 0) {
+          const meaningful = Object.values(artistWeights).filter(w => w >= 0.35).length;
+          axis3 = (meaningful / totalWeight) >= 0.6 ? 'broad' : 'deep';
+        }
+
+        console.log(`  ${userDoc.id} → ${axis3} (${entriesSnap.size} entries)`);
+
+        batch.update(userDoc.ref, { zodiacAxis3: axis3 });
+        processed++;
+        opCount++;
+
+        if (opCount === 500) {
+          batches.push(batch.commit());
+          batch   = db.batch();
+          opCount = 0;
+        }
+      } catch (e) {
+        console.error(`❌ axis3 error for ${userDoc.id}:`, e.message);
+        errors++;
+      }
+    }
+
+    if (opCount > 0) batches.push(batch.commit());
+    await Promise.all(batches);
+
+    console.log(`✅ backfill-zodiac-axis3: ${processed} updated, ${skipped} skipped, ${errors} errors`);
+    res.json({ processed, skipped, errors });
+  } catch (err) {
+    console.error('❌ backfill-zodiac-axis3 failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Lineage — On User Created: write nameLower ────────────────────────────────
-// New users get nameLower written automatically via the Firestore onCreate
-// listener below. This runs server-side so the client never has to think
-// about it.
-//
-// Since this is an Express server (not Firebase Functions), we simulate the
-// trigger with a Firestore onSnapshot on the users collection filtered to
-// docs created in the last 60 seconds. Lightweight — one listener, no polling.
 
 const nameWatchStart = Date.now();
 db.collection('users')
